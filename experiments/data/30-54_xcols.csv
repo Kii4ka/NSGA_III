@@ -1,0 +1,8 @@
+xcols,ycols,rows,file
+38,1,4653,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SQL_AllMeasurements.csv
+31,5,20000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Loan.csv
+35,3,21759,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Data_COVID19_Indonesia.csv
+32,3,1470,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/WA_Fn-UseC_-HR-Employee-Attrition.csv
+31,8,2205,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Marketing_Analytics.csv
+38,5,205,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Car_price_cleaned.csv
+33,1,649,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/student_dropout.csv

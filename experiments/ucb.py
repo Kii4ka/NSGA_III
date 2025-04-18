@@ -1,0 +1,2107 @@
+#!/usr/bin/env python3 -B
+# <!-- vim: set ts=2 sw=2 sts=2 et: -->
+"""
+## Ezr.py
+&copy;  2024 Tim Menzies (timm@ieee.org). BSD-2 license
+
+### USAGE:
+
+python3 ezr.py [OPTIONS]
+
+This code explores multi-objective optimization; i.e. what
+predicts for the better goal values? This code also explores
+active learning; i.e. how to make predictions after looking at
+the fewest number of goal values?
+
+### OPTIONS:
+
+    -b --buffer int    chunk size, when streaming   = 100
+    -B --branch bool   set branch method            = False
+    -d --divide int    half with mean or median     = 1
+    -D --Dull   bool   if true, round to cohen's d  = False
+    -k --decay  float  kappa decay schedule         = 0
+    -L --Last   int    max number of labels         = 30
+    -c --cut    float  borderline best:rest         = 0.5
+    -C --Cohen  float  pragmatically small          = 0.35
+    -e --eg     str    start up action              = mqs
+    -f --fars   int    number of times to look far  = 20
+    -F --Far    float  how far to seek faraway      = 0.8
+    -h --help          show help                    = False
+    -H --Half          for searching for poles      = 1000
+    -i --iter   int    length of done minus label   = 0
+    -k --k      int    low frequency Bayes hack     = 1
+    -l --label  int    initial number of labels     = 4
+    -m --m      int    low frequency Bayes hack     = 2
+    -M --metric str    distance metric              = 'chebyshev'
+    -n --neg    int    negative                     = -1
+    -p --p      int    distance formula exponent    = 2
+    -r --full   bool   full ranking of dataset      = False
+    -s --seed   int    random number seed           = 1234567891
+    -S --Stop   int    min size of tree leaves      = 30
+    -t --train  str    training csv file. row1 has names =
+    data/optimize/config/SS-N.csv
+
+### Data File Format
+
+Training data consists of csv files where "?" denotes missing values.
+Row one  list the columns names, defining the roles of the columns:
+
+- NUMeric column names start with an upper case letter.
+- All other columns are SYMbolic.
+- Names ending with "+" or "-" are goals to maximize/minimize
+- Anything ending in "X" is a column we should ignore.
+
+For example, here is data where the goals are `Lbs-,Acc+,Mpg+`
+i.e. we want to minimize car weight and maximize acceleration
+and maximize fuel consumption.
+
+     Clndrs   Volume  HpX  Model  origin  Lbs-  Acc+  Mpg+
+     -------  ------  ---  -----  ------  ----  ----  ----
+      4       90      48   78     2       1985  21.4   40
+      4       98      79   76     1       2255  17.7   30
+      4       98      68   77     3       2045  18.6   30
+      4       79      67   74     2       2000  16     30
+      ...
+      4      151      85   78     1       2855  17.6   20
+      6      168      132  80     3       2910  11.4   30
+      8      350      165  72     1       4274  12     10
+      8      304      150  73     1       3672  11.5   10
+
+Note that the top rows are
+better than the bottom ones (lighter, faster cars that are
+more economical).
+"""
+# todo: labelling via clustering.
+# ## Setting-up
+# ### Imports
+from __future__ import annotations
+from typing import Any as any
+from typing import List, Dict, Type, Callable, Generator, Union
+from fileinput import FileInput as file_or_stdin
+from dataclasses import dataclass, field, fields
+import datetime
+from math import exp, log, cos, sqrt, pi
+import re, sys, ast, math, random, inspect
+import traceback
+from time import time
+import stats
+import sklearn.preprocessing as preprocessing
+from sklearn.pipeline import Pipeline
+import numpy as np
+from scipy.spatial.distance import cdist
+    
+
+R = random.random
+one = random.choice
+#
+# ###  Types and Classes
+#
+# Some misc types:
+number = Union[float, int]  #
+atom = Union[number, bool, str] # and sometimes "?"
+row = list[atom]
+rows = list[row]
+classes = dict[str, rows]  # `str` is the class name
+
+
+def LIST(): return field(default_factory=list)
+
+
+def DICT(): return field(default_factory=dict)
+
+
+#
+# NUMs and SYMs are both COLumns. All COLumns count `n` (items seen),
+# `at` (their column number) and `txt` (column name).
+@dataclass
+class COL:
+    n: int = 0
+    at: int = 0
+    txt: str = ""
+
+
+# SYMs tracks  symbol counts  and tracks the `mode` (the most common frequent
+# symbol).
+@dataclass
+class SYM(COL):
+    has: dict = DICT()
+    mode: atom = None
+    most: int = 0
+
+    def clone(self: SYM): return SYM(at=self.at, txt=self.txt)
+
+
+# NUMs tracks  `lo,hi` seen so far, as well the `mu` (mean) and `sd` (standard
+# deviation),
+# using Welford's algorithm.
+@dataclass
+class NUM(COL):
+    mu: number = 0
+    m2: number = 0
+    sd: number = 0
+    lo: number = 1E32
+    hi: number = -1E32
+    goal: number = 1
+
+    def clone(self: NUM): return NUM(at=self.at, txt=self.txt)
+
+    # A minus sign at end of a NUM's name says "this is a column to minimize"
+    # (all other goals are to be maximizes).
+    def __post_init__(self: NUM) -> None:
+        if self.txt and self.txt[-1] == "-": self.goal = 0
+
+
+#
+# COLS are a factory that reads some `names` from the first
+# row , the creates the appropriate columns.
+@dataclass
+class COLS:
+    names: list[str]  # column names
+    all: list[COL] = LIST()  # all NUMS and SYMS
+    x: list[COL] = LIST()  # independent COLums
+    y: list[COL] = LIST()  # dependent COLumns
+    klass: COL = None
+
+    # Collect  `all` the COLs as well as the dependent/independent `x`,`y` lists.
+    # Upper case names are NUMerics. Anything ending in `+` or `-` is a goal to
+    # be maximized of minimized. Anything ending in `X` is ignored.
+    def __post_init__(self: COLS) -> None:
+        for at, txt in enumerate(self.names):
+            a, z = txt[0], txt[-1]
+            col = (NUM if a.isupper() else SYM)(at=at, txt=txt)
+            self.all.append(col)
+            if z != "X":
+                (self.y if z in "!+-" else self.x).append(col)
+                if z == "!": self.klass = col
+                if z == "-": col.goal = 0
+
+
+#
+# DATAs store `rows`, which are summarized in `cols`.
+@dataclass
+class DATA:
+    cols: COLS = None  # summaries of rows
+    rows: rows = LIST()  # rows
+
+    # Another way to create a DATA is to copy the columns structure of
+    # an existing DATA, then maybe load in some rows to that new DATA.
+    def clone(self: DATA, rows: rows = []) -> DATA:
+        return DATA().add(self.cols.names).adds(rows)
+
+
+#
+# ### Decorators
+# I like how JULIA and CLOS lets you define all your data types
+# before anything else. Also, you can group together related methods
+# from different classes. I think that really simplifies explaining the
+# code. So this `of` decorator lets me
+# define methods separately to class definition (and, btw,  it collects a
+# documentation strings).
+def of(doc):
+    def doit(fun):
+        fun.__doc__ = doc
+        self = inspect.getfullargspec(fun).annotations['self']
+        setattr(globals()[self], fun.__name__, fun)
+
+    return doit
+
+
+#
+# ## Methods
+# ### Misc
+#
+@of("Return central tendency of a DATA.")
+def mid(self: DATA) -> row:
+    return [col.mid() for col in self.cols.all]
+
+
+@of("Return central tendency of NUMs.")
+def mid(self: NUM) -> number: return self.mu
+
+
+@of("Return central tendency of SYMs.")
+def mid(self: SYM) -> number: return self.mode
+
+
+@of("Return diversity of a NUM.")
+def div(self: NUM) -> number: return self.sd
+
+
+@of("Return diversity of a SYM.")
+def div(self: SYM) -> number: return self.ent()
+
+
+@of("Returns 0..1 for min..max.")
+def norm(self: NUM, x) -> number:
+    return x if x == "?" else ((x - self.lo) / (self.hi - self.lo + 1E-32))
+
+
+@of("Entropy = measure of disorder.")
+def ent(self: SYM) -> number:
+    return - sum(n / self.n * log(n / self.n, 2) for n in self.has.values())
+
+
+# ### Add
+@of("add COL with many values.")
+def adds(self: COL, src) -> COL:
+    [self.add(row) for row in src];
+    return self
+
+
+@of("add DATA with many values.")
+def adds(self: DATA, src) -> DATA:
+    [self.add(row) for row in src];
+    return self
+
+
+@of("As a side-effect on adding one row (to `rows`), update the column summaries ("
+    "in `cols`).")
+def add(self: DATA, row: row) -> DATA:
+    if self.cols:
+        self.rows += [self.cols.add(row)]
+    else:
+        self.cols = COLS(names=row)  # for row q
+    return self
+
+
+@of("add all the `x` and `y` cols.")
+def add(self: COLS, row: row) -> row:
+    [col.add(row[col.at]) for cols in [self.x, self.y] for col in cols]
+    return row
+
+
+@of("If `x` is known, add this COL.")
+def add(self: COL, x: any) -> any:
+    if x != "?":
+        self.n += 1
+        self.add1(x)
+
+
+@of("add symbol counts.")
+def add1(self: SYM, x: any) -> any:
+    self.has[x] = self.has.get(x, 0) + 1
+    if self.has[x] > self.most: self.mode, self.most = x, self.has[x]
+    return x
+
+
+@of("add `mu` and `sd` (and `lo` and `hi`). If `x` is a string, coerce to a number.")
+def add1(self: NUM, x: any) -> number:
+    self.lo = min(x, self.lo)
+    self.hi = max(x, self.hi)
+    d = x - self.mu
+    self.mu += d / self.n
+    self.m2 += d * (x - self.mu)
+    self.sd = 0 if self.n < 2 else (self.m2 / (self.n - 1)) ** .5
+
+
+#
+# ### Guessing
+@of("Guess values at same frequency of `has`.")
+def guess(self: SYM) -> any:
+    r = R()
+    for x, n in self.has.items():
+        r -= n / self.n
+        if r <= 0: return x
+    return self.mode
+
+
+@of("Guess values with some `mu` and `sd` (using Box-Muller).")
+def guess(self: NUM) -> number:
+    while True:
+        x1 = 2.0 * R() - 1
+        x2 = 2.0 * R() - 1
+        w = x1 * x1 + x2 * x2
+        if w < 1:
+            tmp = self.mu + self.sd * x1 * sqrt((-2 * log(w)) / w)
+            return max(self.lo, min(self.hi, tmp))
+
+
+@of("Guess a row like the other rows in DATA.")
+def guess(self: DATA, fun: Callable = None) -> row:
+    fun = fun or (lambda col: col.guess())
+    out = ["?" for _ in self.cols.all]
+    for col in self.cols.x: out[col.at] = fun(col)
+    return out
+
+
+# @of("stochastic version of Guess. maybe too clever?")
+# def exploit(self:COL, other:COL, n=20):
+#   n       = (self.n + other.n + 2*the.k)
+#   pr1,pr2 = (self.n + the.k) / n, (other.n + the.k) / n
+#   key     = lambda x: 2*self.like(x,pr1) -  other.like(x,pr2)
+#   def trio():
+#     x=self.guess()
+#     return key(x),self.at,x
+#   return max([trio() for _ in range(n)], key=nth(0))
+#
+@of("Guess a value that is more like `self` than  `other`.")
+def exploit(self: NUM, other: NUM):
+    a = self.like(self.mid())
+    b = other.like(self.mid())
+    c = (self.n * a - other.n * b) / (self.n + other.n)
+    return c, self, self.mid()
+
+
+@of("Guess a value that is more like `self` than  `other`.")
+def exploit(self: SYM, other: SYM):
+    priora = self.n / (self.n + other.n)
+    priorb = other.n / (self.n + other.n)
+    a = self.like(self.mid(), priora)
+    b = other.like(self.mid(), priorb)
+    c = a - b
+    return c, self, self.mid(),
+
+
+@of("Guess a row more like `self` than `other`.")
+def exploit(self: DATA, other: DATA, top=1000, used=None):
+    out = ["?" for _ in self.cols.all]
+    for _, col, x in sorted(
+            [coli.exploit(colj) for coli, colj in zip(self.cols.x, other.cols.x)],
+            reverse=True, key=nth(0))[:top]:
+        out[col.at] = x
+        # if used non-nil, keep stats on what is used
+        if used != None:
+            used[col.at] = used.get(col.at, None) or col.clone()
+            used[col.at].add(x)
+    return out
+
+
+@of("Guess a row in between the rows of `self` and `other`.")
+def explore(self: DATA, other: DATA):
+    out = self.guess()
+    for coli, colj in zip(self.cols.x, other.cols.x): out[coli.at] = coli.explore(
+        colj)
+    return out
+
+
+@of("Guess value on the border between `self` and `other`.")
+def explore(self: COL, other: COL, n=20):
+    n = (self.n + other.n + 2 * the.k)
+    pr1, pr2 = (self.n + the.k) / n, (other.n + the.k) / n
+    key = lambda x: abs(self.like(x, pr1) - other.like(x, pr2))
+    return min([self.guess() for _ in range(n)], key=key)
+
+
+#
+# ## Distance
+@of("Between two values (Aha's algorithm).")
+def dist(self: COL, x: any, y: any) -> float:
+    return 1 if x == y == "?" else self.dist1(x, y)
+
+
+@of("Distance between two SYMs.")
+def dist1(self: SYM, x: number, y: number) -> float: return x != y
+
+
+@of("Distance between two NUMs.")
+def dist1(self: NUM, x: number, y: number) -> float:
+    x, y = self.norm(x), self.norm(y)
+    x = x if x != "?" else (1 if y < 0.5 else 0)
+    y = y if y != "?" else (1 if x < 0.5 else 0)
+    return abs(x - y)
+
+
+@of("Euclidean distance between two rows.")
+def dist(self: DATA, r1: row, r2: row) -> float:
+    n = sum(c.dist(r1[c.at], r2[c.at]) ** the.p for c in self.cols.x)
+    return (n / len(self.cols.x)) ** (1 / the.p)
+
+
+@of("Sort rows randomly")
+def shuffle(self: DATA) -> DATA:
+    random.shuffle(self.rows)
+    return self
+
+
+@of("Sort rows by distance.")
+def distances(self: DATA) -> DATA:
+    if the.metric == 'chebyshev':
+        self.rows = sorted(self.rows, key=lambda r: self.chebyshev(r))
+    if the.metric == 'd2h':
+        self.rows = sorted(self.rows, key=lambda r: self.d2h(r))
+    return self
+
+
+@of("Compute distance of one row to the best `y` values.")
+def distance(self: DATA, row: row) -> number:
+    if the.metric == 'chebyshev':
+        return max(abs(col.goal - col.norm(row[col.at])) for col in self.cols.y)
+    if the.metric == 'd2h':
+        d = sum(abs(c.goal - c.norm(row[c.at])) ** 2 for c in self.cols.y)
+        return (d / len(self.cols.y)) ** (1 / the.p)
+
+
+@of("Sort rows by Chebyshev distance.")
+def chebyshevs(self: DATA) -> DATA:
+    self.rows = sorted(self.rows, key=lambda r: self.chebyshev(r))
+    return self
+
+
+@of("Compute Chebyshev distance of one row to the best `y` values.")
+def chebyshev(self: DATA, row: row) -> number:
+    return max(abs(col.goal - col.norm(row[col.at])) for col in self.cols.y)
+
+
+@of("Sort rows by the Euclidean distance of the goals to heaven.")
+def d2hs(self: DATA) -> DATA:
+    self.rows = sorted(self.rows, key=lambda r: self.d2h(r))
+    return self
+
+
+@of("Compute euclidean distance of one row to the best `y` values.")
+def d2h(self: DATA, row: row) -> number:
+    d = sum(abs(c.goal - c.norm(row[c.at])) ** 2 for c in self.cols.y)
+    return (d / len(self.cols.y)) ** (1 / the.p)
+
+
+#
+# ### Nearest Neighbor
+@of("Sort `rows` by their distance to `row1`'s x values.")
+def neighbors(self: DATA, row1: row, rows: rows = None) -> rows:
+    return sorted(rows or self.rows, key=lambda row2: self.dist(row1, row2))
+
+
+@of("Return predictions for `cols` (defaults to klass column).")
+def predict(self: DATA, row1: row, rows: rows, cols=None, k=2):
+    cols = cols or self.cols.y
+    got = {col.at: [] for col in cols}
+    for row2 in self.neighbors(row1, rows)[:k]:
+        d = 1E-32 + self.dist(row1, row2)
+        [got[col.at].append((d, row2[col.at])) for col in cols]
+    return {col.at: col.predict(got[col.at]) for col in cols}
+
+
+@of("Find weighted sum of numbers (weighted by distance).")
+def predict(self: NUM, pairs: list[tuple[float, number]]) -> number:
+    ws, tmp = 0, 0
+    for d, num in pairs:
+        w = 1 / d ** 2
+        ws += w
+        tmp += w * num
+    return tmp / ws
+
+
+@of("Sort symbols by votes (voting by distance).")
+def predict(self: SYM, pairs: list[tuple[float, any]]) -> number:
+    votes = {}
+    for d, x in pairs:
+        votes[x] = votes.get(x, 0) + 1 / d ** 2
+    return max(votes, key=votes.get)
+
+
+#
+# ### Cluster
+@dataclass
+class CLUSTER:
+    data: DATA
+    right: row
+    left: row
+    mid: row
+    cut: number
+    fun: Callable
+    lvl: int = 0
+    lefts: CLUSTER = None
+    rights: CLUSTER = None
+
+    def __repr__(self: CLUSTER) -> str:
+        return f"{'|.. ' * self.lvl}{len(self.data.rows)}"
+
+    def leaf(self: CLUSTER, data: DATA, row: row) -> CLUSTER:
+        d = data.dist(self.left, row)
+        if self.lefts and self.lefts.fun(d, self.lefts.cut):  return self.lefts.leaf(
+            data, row)
+        if self.rights and self.rights.fun(d,
+                                           self.rights.cut): return self.rights.leaf(
+            data, row)
+        return self
+
+    def nodes(self: CLUSTER):
+        def leafp(x):
+            return x.lefts == None or x.rights == None
+
+        yield self, leafp(self)
+        for node in [self.lefts, self.rights]:
+            if node:
+                for x, isLeaf in node.nodes(): yield x, isLeaf
+
+
+@of("Return two distant rows, optionally sorted into best, then rest")
+def twoFar(self: DATA, rows: rows, sortp=False, samples: int = None) -> tuple[
+    row, row]:
+    left, right = max(((one(rows), one(rows)) for _ in range(samples or the.fars)),
+                      key=lambda two: self.dist(*two))
+    if sortp and self.distance(right) < self.distance(
+            left): right, left = left, right
+    return left, right
+
+
+@of("Find two distant points within the `region`. Used by half()")
+def twoFaraway(self: DATA, region: rows, before=None, sortp=False) -> tuple[
+    row, row, float]:
+    region = random.choices(region, k=min(the.Half, len(region)))
+    x = before or self.faraway(random.choice(region), region)
+    y = self.faraway(x, region)
+    if sortp and self.distance(y) < self.distance(x): x, y = y, x
+    return x, y, self.dists(x, y)
+
+
+@of("Find something far away from `r1` with the `region`. Used by twoFaraway()")
+def faraway(self: DATA, r1: row, region: rows) -> row:
+    farEnough = int(
+        len(region) * the.Far)  # to avoid outliers, don't go 100% far away
+    return self.neighbors(r1, region)[farEnough]
+
+
+@of("Sort the `region` (default=`i.rows`),ascending, by distance to r1")
+def neighbors(self: DATA, r1: row, region: rows = None) -> list[row]:
+    return sorted(region or self.rows, key=lambda r2: self.dists(r1, r2))
+
+
+@of("Distances between two rows")
+def dists(self: DATA, r1: row, r2: row) -> float:
+    n = sum(c.dist(r1[c.at], r2[c.at]) ** the.p for c in self.cols.x)
+    return (n / len(self.cols.x)) ** (1 / the.p)
+
+
+@of("Divide rows by distance to two faraway points")
+def half(self: DATA, region: rows, sortp=False, before=None) -> tuple[
+    rows, rows, row]:
+    mid = int(len(region) // 2)
+    left, right, C = self.twoFaraway(region, sortp=sortp, before=before)
+    project = lambda row1: (self.dists(row1, left) ** 2 + C ** 2 - self.dists(row1,
+                                                                              right) ** 2) / (
+                                   2 * C + 1E-30)
+    tmp = sorted(region, key=project)
+    return tmp[:mid], tmp[mid:], left, right
+
+
+@of("Divide rows by distance to two faraway points")
+def half_mean(self: DATA, rows: rows, sortp=False) -> tuple[
+    rows, rows, row, row, float]:
+    left, right = self.twoFar(rows, sortp=sortp)
+    C = self.dist(left, right)
+    lefts, rights = [], []
+    project = lambda row: (self.dist(row, left) ** 2 + C ** 2 - self.dist(row,
+                                                                          right)
+                           ** 2) / (
+                                  2 * C + 1E-30)
+    for row in rows:
+        (lefts if project(row) <= C / 2 else rights).append(row)
+    lefts.sort(key=project)
+    return self.dist(left, lefts[-1]), lefts, rights, left, right
+
+
+@of("Divide rows by distance to two faraway points")
+def half_median(self: DATA, rows: rows, sortp=False) -> tuple[
+    rows, rows, row, row, float]:
+    mid = int(len(rows) // 2)
+    left, right = self.twoFar(rows, sortp=sortp)
+    C = self.dist(left, right)
+    project = lambda row: (self.dist(row, left) ** 2 + C ** 2 - self.dist(row,
+                                                                          right)
+                           ** 2) / (
+                                  2 * C + 1E-30)
+    tmp = sorted(self.rows, key=project)
+    return self.dist(left, tmp[mid]), tmp[:mid], tmp[mid:], left, right
+
+
+@of("recursive divide rows using distance to two far points")
+def cluster(self: DATA, rows: rows = None, sortp=False, stop=None, cut=None,
+            fun=None, lvl=0):
+    stop = stop or the.Stop
+    rows = rows or self.rows
+    cut1, ls, rs, left, right = self.half(rows, sortp=sortp)
+    it = CLUSTER(data=self.clone(rows), cut=cut, fun=fun, left=left, right=right,
+                 mid=rs[0], lvl=lvl)
+    if len(ls) > stop and len(ls) < len(rows): it.lefts = self.cluster(ls, sortp,
+                                                                       stop, cut1,
+                                                                       le, lvl + 1)
+    if len(rs) > stop and len(rs) < len(rows): it.rights = self.cluster(rs, sortp,
+                                                                        stop, cut1,
+                                                                        gt, lvl + 1)
+    return it
+
+
+@of("Recursively bi-cluster `region`, recurse only down the best half.")
+def branch_V(self: DATA, region: rows = None, stop=None, used=[], rest=None, evals=1,
+             before=None, left_count=0,
+             right_count=0):
+    region = region or self.rows
+    if region == self.rows:
+        random.shuffle(region)
+    stop = stop or the.Stop
+    rest = rest or []
+
+    if len(used) < stop:
+        lefts, rights, left, right = self.half(region, True, before)
+
+        if left not in used and left_count < stop // 2:
+            used.append(left)
+            return self.branch(lefts, stop, used, rest + rights, evals + 1, left,
+                               left_count + 1, right_count)
+
+        elif right not in used and right_count < stop // 2:
+            used.append(right)
+            return self.branch(rights, stop, used, rest + lefts, evals + 1, right,
+                               left_count, right_count + 1)
+
+    todo = [r for r in self.rows if r not in used]
+    return todo, used
+
+
+@of("Recursively bi-cluster `region`, recurse only down the best half.")
+def branch(self: DATA, region: rows = None, stop=None, used=[], rest=None, evals=1,
+           before=None):
+    region = region or self.rows
+    if region == self.rows: random.shuffle(region)
+    stop = stop or 2 * len(region) ** 0.5
+    rest = rest or []
+
+    if len(region) > stop:
+        lefts, rights, left, right = self.half(region, True, before)
+        if left not in used:
+            used.append(left)
+        if right not in used:
+            used.append(right)
+
+        return self.branch(lefts, stop, used, rest + rights, evals + 1, left)
+    else:
+        todo = [r for r in self.rows if r not in used]
+        return todo, used
+
+
+le = lambda x, y: x <= y
+gt = lambda x, y: x > y
+
+
+@of("Recursively bi-cluster `region`, recurse only down the best half.")
+def branch_2_point(self: DATA, region: rows = None, stop=None, used=[], evals=1):
+    region = region or self.rows
+    if region == self.rows: random.shuffle(region)
+    stop = stop or the.Stop
+
+    if len(used) + len(region) / 2 < stop:
+        while len(used) < stop:
+            used.append(region.pop())
+        # print(len(used))
+        return [r for r in self.rows if r not in used], used
+
+    if len(used) < stop:
+        distance, lefts, rights, left, right = self.half_median(region, True)
+        if left not in used:
+            used.append(left)
+        if right not in used:
+            used.append(right)
+
+        return self.branch_2_point(lefts, stop, used, evals + 1)
+    else:
+        return [r for r in self.rows if r not in used], used
+
+
+@of("Diversity sampling (one per items).")
+def diversity(self: DATA, rows: rows = None, stop=None):
+    rows = rows or self.rows
+    cluster = self.cluster(rows, stop=stop or math.floor(len(rows) ** 0.5))
+    for node, leafp in cluster.nodes():
+        if leafp:
+            yield node.mid
+
+
+@of("How much DATA likes a `row`.")
+def loglike(self: DATA, r: row, nall: int, nh: int) -> float:
+    prior = (len(self.rows) + the.k) / (nall + the.k * nh)
+    likes = [c.like(r[c.at], prior) for c in self.cols.x if r[c.at] != "?"]
+    return sum(log(x) for x in likes + [prior] if x > 0)
+
+
+@of("How much a SYM likes a value `x`.")
+def like(self: SYM, x: any, prior: float) -> float:
+    return (self.has.get(x, 0) + the.m * prior) / (self.n + the.m)
+
+
+@of("How much a NUM likes a value `x`.")
+def like(self: NUM, x: number, prior=None) -> float:
+    v = self.sd ** 2 + 1E-30
+    nom = exp(-1 * (x - self.mu) ** 2 / (2 * v)) + 1E-30
+    denom = (2 * pi * v) ** 0.5
+    return min(1, nom / (denom + 1E-30))
+
+
+#
+# ### Active Learning
+@of("ranked")
+def ranked(self: DATA, rows): return self.clone(rows).distances().rows
+
+
+@of("active learning")
+def activeLearning(self: DATA, score=lambda B, R: B - R, generate=None, faster=True,
+                   label=None, max_label=None):
+    def todos(todo):
+        if faster:  # Apply our sorting heuristics to just a small buffer at start
+            # of "todo"
+            # rotate back half of buffer to end of list, fill the gap with later
+            # items
+            n = the.buffer // 2
+            if the.buffer == 1000:
+                random.shuffle(todo)
+                return todo[:1000], []
+            return todo[:n] + todo[2 * n: 3 * n], todo[3 * n:] + todo[n:2 * n]
+
+        else:  # Apply our sorting heuristics to all of todo.
+            return todo, []
+
+    def guess(todo: rows, done: rows) -> rows:
+        cut = int(.5 + len(done) ** the.cut)
+        best = self.clone(done[:cut])
+        rest = self.clone(done[cut:])
+        a, b = todos(todo)
+        the.iter = len(done) - the.label
+        if generate:
+            return self.neighbors(generate(best, rest), a) + b
+        else:
+            if score == 'UCB_GPM':
+                return self.ranked(UCB_GPM(self, a, done)) + b
+            elif score == 'NSGA_III':
+                from nsga3_score import nsga3_score
+                scores = []
+                for i in range(len(a)):
+                    B = self.d2h(a[i])  # Best value
+                    R = abs(self.d2h(a[i]) - self.d2h(self.guess(done)))  # Rest/uncertainty
+                    scores.append(nsga3_score(B, R))
+                return sorted(a, key=lambda r: scores[a.index(r)], reverse=True) + b
+            else:
+                key = lambda r: score(best.loglike(r, len(done), 2),
+                                      rest.loglike(r, len(done), 2))
+                return sorted(a, key=key, reverse=True) + b
+
+    def loop(todo: rows, done: rows) -> rows:
+        if max_label:
+            the.Last = max_label
+        while len(todo) > 2 and len(done) < the.Last:
+            top, *todo = guess(todo, done)
+            done += [top]
+            done = self.ranked(done)
+
+        if the.full == True:
+            the.buffer = 1000
+            top = guess(todo, done)
+            done += top[:40 - the.Last]
+            done = self.ranked(done)
+
+        return done
+
+    random.shuffle(self.rows)
+    if label:
+        todo, done = self.rows[label:], self.ranked(self.rows[:label])
+    else:
+        todo, done = self.rows[the.label:], self.ranked(self.rows[:the.label])
+
+    if the.branch == True:
+        todo, done = self.branch(used=[])
+        if the.Last == 0: return done
+
+    if the.branch == 'branch_2_point':
+        todo, done = self.branch_2_point(used=[])
+        if the.Last == 0: return done
+
+    if score == 'UCB_Linear':
+        return self.ranked(UCB_Linear(self, todo, done))
+
+    if score == 'PI_Linear':
+        return self.ranked(PI_Linear(self, todo, done))
+
+    if score == 'EI_Linear':
+        return self.ranked(EI_Linear(self, todo, done))
+
+    if score == 'UCB_GPM':
+        return self.ranked(UCB_GPM(self, todo, done))
+    if score == 'SimAnneal':
+        return self.ranked(SimAnneal(self, todo, done))
+
+    return loop(todo, done)
+
+
+# @of("active learning ALBD")
+# def activeLearningALBD(self: DATA, scoring_policies, generate=None, faster=True,
+#                    label=None, max_label=None):
+#     def todos(todo):
+#         if faster:  # Apply our sorting heuristics to just a small buffer at start
+#             # of "todo"
+#             # rotate back half of buffer to end of list, fill the gap with later
+#             # items
+#             n = the.buffer // 2
+#             if the.buffer == 1000:
+#                 random.shuffle(todo)
+#                 return todo[:1000], []
+#             return todo[:n] + todo[2 * n: 3 * n], todo[3 * n:] + todo[n:2 * n]
+
+#         else:  # Apply our sorting heuristics to all of todo.
+#             return todo, []
+
+#     def guess(todo: rows, done: rows) -> rows:
+#         cut = int(.5 + len(done) ** the.cut)
+#         best = self.clone(done[:cut])
+#         rest = self.clone(done[cut:])
+#         a, b = todos(todo)
+#         the.iter = len(done) - the.label
+    
+#         # Calculate base scores once for efficiency
+#         base_scores = {}
+#         for row in a:
+#             row_tuple = tuple(row)
+#             b_score = best.loglike(row, len(done), 2)
+#             r_score = rest.loglike(row, len(done), 2)
+#             base_scores[row_tuple] = (b_score, r_score)
+        
+#         # Normalized scores from each policy
+#         policy_scores = {tuple(row): [] for row in a}
+        
+#         # Calculate scores from each policy
+#         for score in scoring_policies:
+#             # Calculate score for each row using this policy
+#             raw_scores = {}
+#             for row_tuple, (b_score, r_score) in base_scores.items():
+#                 raw_scores[row_tuple] = score[1](b_score, r_score)
+            
+#             # Normalize scores for this policy to range [0,1]
+#             score_values = list(raw_scores.values())
+#             if len(score_values) > 1:
+#                 min_score = min(score_values)
+#                 max_score = max(score_values)
+#                 score_range = max_score - min_score
+                
+#                 if score_range > 0:
+#                     for row_tuple, raw_score in raw_scores.items():
+#                         policy_scores[row_tuple].append((raw_score - min_score) / score_range)
+#                 else:
+#                     # All same score
+#                     for row_tuple in raw_scores:
+#                         policy_scores[row_tuple].append(0.5)
+#             else:
+#                 # Only one row
+#                 for row_tuple in raw_scores:
+#                     policy_scores[row_tuple].append(0.5)
+        
+#         # Calculate combined score (average of normalized scores)
+#         combined_scores = {}
+#         for row_tuple, scores in policy_scores.items():
+#             if scores:
+#                 combined_scores[row_tuple] = sum(scores) / len(scores)
+#             else:
+#                 combined_scores[row_tuple] = 0
+        
+#         # Add diversity bonus based on distance to recently selected items
+#         if len(done) > 3:
+#             # Adaptive diversity weight - stronger early, weaker later
+#             progress = the.iter / the.Last if the.Last > 0 else 0.5
+#             diversity_weight = 0.2 * (1.0 - progress)
+            
+#             # Consider most recent selections
+#             recent_examples = done[-3:]
+            
+#             for row_tuple in combined_scores:
+#                 row = next((r for r in a if tuple(r) == row_tuple), None)
+#                 if row:
+#                     # Average distance to recent selections
+#                     avg_dist = sum(self.dist(row, recent) for recent in recent_examples) / len(recent_examples)
+#                     combined_scores[row_tuple] += diversity_weight * avg_dist
+        
+#         # Sort rows by combined score (higher is better)
+#         sorted_rows = sorted(a, key=lambda r: combined_scores.get(tuple(r), 0), reverse=True)
+        
+#         return sorted_rows + b
+
+#     def loop(todo: rows, done: rows) -> rows:
+#         if max_label:
+#             the.Last = max_label
+#         while len(todo) > 2 and len(done) < the.Last:
+#             top, *todo = guess(todo, done)
+#             done += [top]
+#             done = self.ranked(done)
+
+#         if the.full == True:
+#             the.buffer = 1000
+#             top = guess(todo, done)
+#             done += top[:40 - the.Last]
+#             done = self.ranked(done)
+
+#         return done
+
+#     random.shuffle(self.rows)
+#     if label:
+#         todo, done = self.rows[label:], self.ranked(self.rows[:label])
+#     else:
+#         todo, done = self.rows[the.label:], self.ranked(self.rows[:the.label])
+
+#     if the.branch == True:
+#         todo, done = self.branch(used=[])
+#         if the.Last == 0: return done
+
+#     if the.branch == 'branch_2_point':
+#         todo, done = self.branch_2_point(used=[])
+#         if the.Last == 0: return done
+
+#     return loop(todo, done)
+
+
+# ## Utils
+
+# ### One-Liners
+
+def cdf(x, mu, sd):
+    def cdf1(z): return 1 - 0.5 * 2.718 ** (-0.717 * z - 0.416 * z * z)
+
+    z = (x - mu) / sd
+    return cdf1(z) if z >= 0 else 1 - cdf1(-z)
+
+
+# non parametric mid and div
+def medianSd(a: list[number]) -> tuple[number, number]:
+    a = sorted(a)
+    return a[int(0.5 * len(a))], (a[int(0.9 * len(a))] - a[int(0.1 * len(a))])
+
+
+# Return a function that returns the `n`-th idem.
+def nth(n): return lambda a: a[n]
+
+
+# Rounding off
+def r2(x): return round(x, 2)
+
+
+def r3(x): return round(x, 3)
+
+
+# Pring to standard error
+def dot(s="."): print(s, file=sys.stderr, flush=True, end="")
+
+
+# Timing
+def timing(fun) -> number:
+    start = time()
+    fun()
+    return time() - start
+
+
+# M-by-N cross val
+def xval(lst: list, m: int = 5, n: int = 5, some: int = 10 ** 6) -> Generator[
+    rows, rows]:
+    for _ in range(m):
+        random.shuffle(lst)
+        for n1 in range(n):
+            lo = len(lst) / n * n1
+            hi = len(lst) / n * (n1 + 1)
+            train, test = [], []
+            for i, x in enumerate(lst):
+                (test if i >= lo and i < hi else train).append(x)
+            train = random.choices(train, k=min(len(train), some))
+            yield train, test
+
+
+# ### Strings to Things
+
+def coerce(s: str) -> atom:
+    "Coerces strings to atoms."
+    try:
+        return ast.literal_eval(s)
+    except Exception:
+        return s
+
+
+def csv(file) -> Generator[row]:
+    infile = sys.stdin if file == "-" else open(file)
+    with infile as src:
+        for line in src:
+            line = re.sub(r'([\n\t\r ]|#.*)', '', line)
+            if line: yield [coerce(s.strip()) for s in line.split(",")]
+
+
+# ### Settings and CLI
+class SETTINGS:
+    def __init__(self, s: str) -> None:
+        "Make one slot for any line  `--slot ... = value`"
+        self._help = s
+        want = r"\n\s*-\w+\s*--(\w+).*=\s*(\S+)"
+        for m in re.finditer(want, s): self.__dict__[m[1]] = coerce(m[2])
+        self.sideEffects()
+
+    def __repr__(self) -> str:
+        "hide secret slots (those starting with '_'"
+        return str({k: v for k, v in self.__dict__.items() if k[0] != "_"})
+
+    def cli(self):
+        "Update slots from command-line"
+        d = self.__dict__
+        for k, v in d.items():
+            v = str(v)
+            for c, arg in enumerate(sys.argv):
+                after = sys.argv[c + 1] if c < len(sys.argv) - 1 else ""
+                if arg in ["-" + k[0], "--" + k]:
+                    d[k] = coerce("False" if v == "True" else (
+                        "True" if v == "False" else after))
+        self.sideEffects()
+
+    def sideEffects(self):
+        "Run side-effects."
+        d = self.__dict__
+        random.seed(d.get("seed", 1))
+        if d.get("help", False):
+            sys.exit(print(self._help))
+
+
+#
+
+def normalized_exp(k, n, shift):
+    exp_values = [math.exp(0.25 * j) for j in range(n)]
+    min_exp, max_exp = min(exp_values), max(exp_values)
+    return (math.exp(0.25 * k) - min_exp) / (max_exp - min_exp) + shift
+
+
+def exploit(B, R):
+    return B
+
+
+def explore(B, R):
+    return (B + R) / (abs(B - R) + 10 ** -30)
+
+
+# # Add this to your ucb.py file
+# def nsga3_score(B, R):
+#     """
+#     NSGA-III based scoring function for active learning
+    
+#     Returns a score where higher values indicate better candidates
+#     """
+    
+#     # Treat B and R as two objectives
+#     objs = np.array([[B, R]])
+    
+#     # Handle edge cases
+#     if np.abs(B) < 1e-10 and np.abs(R) < 1e-10:
+#         return 0
+    
+#     # Normalize objectives
+#     objs_max = np.max(np.abs(objs))
+#     if objs_max > 0:
+#         objs = objs / objs_max
+    
+#     # Generate simplified reference vectors for two objectives
+#     ref_vectors = np.array([[1, 0], [0, 1], [0.5, 0.5]])
+    
+#     # Calculate cosine similarity to reference vectors
+#     norm = np.sqrt(np.sum(objs**2))
+#     if norm < 1e-10:  # If objectives are very close to origin
+#         return 0  
+    
+#     # Normalize objs to unit vector
+#     objs_norm = objs / norm
+    
+#     # Calculate cosine similarity
+#     cosine = np.dot(objs_norm, ref_vectors.T)
+    
+#     # Calculate perpendicular distance
+#     distance = norm * np.sqrt(1 - cosine**2)
+    
+#     # Return negative minimum distance (higher score is better)
+#     return -np.min(distance)
+
+
+# ## Tests
+class egs:
+    def all():
+        for s in dir(egs):
+            if s[0] != "_" and s != "all":
+                print("\n---------------------------", s,
+                      "-------------------------------")
+                random.seed(the.seed)
+                try:
+                    getattr(egs, s)()
+                except Exception:
+                    print("FAIL!!!!!! ", s, Exception)
+
+    def nums():
+        r = 256
+        n1 = NUM().adds([R() ** 2 for _ in range(r)])
+        n2 = NUM().adds([n1.guess() for _ in range(r)])
+        assert abs(n1.mu - n2.mu) < 0.05, "nums mu?"
+        assert abs(n1.sd - n2.sd) < 0.05, "nums sd?"
+
+    def syms():
+        r = 256
+        n1 = SYM().adds("aaaabbc")
+        n2 = SYM().adds(n1.guess() for _ in range(r))
+        assert abs(n1.mode == n2.mode), "syms mu?"
+        assert abs(n1.ent() - n2.ent()) < 0.05, "syms ent?"
+
+    def csvs():
+        d = DATA()
+        n = 0
+        for row in csv(the.train): n += len(row)
+        assert n == 3192, "csv?"
+
+    def reads():
+        d = DATA().adds(csv(the.train))
+        assert d.cols.y[1].n == 398, "reads?"
+
+    def likings():
+        d = DATA().adds(csv(the.train)).distances()
+        random.shuffle(d.rows)
+        lst = sorted(round(d.loglike(row, 2000, 2), 2) for row in d.rows[:100])
+        # print(lst)
+
+    def order():
+        for i, row in enumerate(DATA().adds(csv(the.train)).distances().rows):
+            if i % 30 == 0: print(f"{row}")
+
+    def chebys():
+        d = DATA().adds(csv(the.train))
+        random.shuffle(d.rows)
+        lst = d.chebyshevs().rows
+        mid = len(lst) // 2
+        good, bad = lst[:mid], lst[mid:]
+        dgood, dbad = d.clone(good), d.clone(bad)
+        lgood, lbad = dgood.loglike(bad[-1], len(lst), 2), dbad.loglike(bad[-1],
+                                                                        len(lst), 2)
+        assert lgood < lbad, "chebyshev?"
+
+    def guesses():
+        d = DATA().adds(csv(the.train))
+        random.shuffle(d.rows)
+        lst = d.distances().rows
+        mid = len(lst) // 2
+        good, bad = lst[:mid], lst[mid:]
+        dgood, dbad = d.clone(good), d.clone(bad)
+        print(good[0])
+        print(bad[-1])
+        print("exploit", dgood.exploit(dbad, top=2))
+        print("exploit", dbad.exploit(dgood, top=2))
+
+    def clones():
+        d1 = DATA().adds(csv(the.train))
+        d2 = d1.clone(d1.rows)
+        for a, b in zip(d1.cols.y, d2.cols.y):
+            for k, v1 in a.__dict__.items():
+                assert v1 == b.__dict__[k], "clone?"
+
+    def heavens():
+        d = DATA().adds(csv(the.train)).d2hs()
+        lst = [row for i, row in enumerate(d.rows) if i % 30 == 0]
+        assert d.d2h(d.rows[0]) < d.d2h(d.rows[-1]), "d2h?"
+
+    def distances():
+        d = DATA().adds(csv(the.train))
+        random.shuffle(d.rows)
+        lst = sorted(round(d.dist(d.rows[0], row), 2) for row in d.rows[:100])
+        for x in lst: assert 0 <= x <= 1, "dists1?"
+        assert .33 <= lst[len(lst) // 2] <= .66, "dists2?"
+
+    def twoFar():
+        d = DATA().adds(csv(the.train))
+        for _ in range(100):
+            a, b = d.twoFar(d.rows, sortp=True)
+            assert d.distance(a) <= d.distance(b), "twoFar?"
+        for _ in range(100):
+            cut, ls, rs, l, r = d.half(d.rows)
+            print(len(ls), len(rs))
+
+    def clusters():
+        d = DATA().adds(csv(the.train))
+        cluster = d.cluster(d.rows, sortp=True)
+        for node, leafp in cluster.nodes():
+            print(r2(d.distance(node.left)) if node.left else "", node, sep="\t")
+
+    def diversities(d=None):
+        d = d or DATA().adds(csv(the.train))
+        # leafs = random.choices(leafs, k=min(50, len(leafs)))
+        print(d.distance(
+            d.clone([row for row in d.diversity(stop=10)]).distances().rows[0]))
+        # print(len([d.clone([row for row in d.diversity(stop=stop)]).distances(
+        # ).rows[0] for _ in range(20)]))
+
+    def clusters1():
+        d = DATA().adds(csv(the.train))
+        mid = d.mid()
+        mids = stats.SOME(txt="mid")
+        somes = [mids]
+        for k in [1, 2, 3, 5]:
+            ks = stats.SOME(txt=f"k{k}")
+            somes += [ks]
+            for train, test in xval(d.rows):  # 5 -by 5 cross-val
+                d1 = d.clone(train)
+                for want in test:
+                    for col in d1.cols.y:
+                        mids.add((mid[col.at] - want[col.at]) / col.div())
+                    rows = d1.neighbors(want, train)[:k]
+                    got = d.predict(want, rows, k=k)
+                    for at, got1 in got.items():
+                        sd = d.cols.all[at].div()
+                        ks.add((want[at] - got1) / sd)
+        stats.report(somes)
+
+    def clusters2():
+        d = DATA().adds(csv(the.train))
+        somes = []
+        mid1s = stats.SOME(txt="mid-leaf")
+        # mid0s  = stats.SOME(txt="mid-all")
+        somes += [mid1s]
+        for k in [1, 2, 3, 4, 5]:
+            ks = stats.SOME(txt=f"k{k}")
+            somes += [ks]
+            for train, test in xval(d.rows):
+                all = d.clone(train)
+                cluster = d.cluster(train)
+                d1 = d.clone(train)
+                mid0 = d1.mid()
+                for want in test:
+                    # for col in d1.cols.y: mid0s.add((mid0[col.at] - want[
+                    # col.at])/col.div())
+                    leaf = cluster.leaf(d, want)
+                    rows = leaf.data.rows
+                    got = d.predict(want, rows, k=k)
+                    mid1 = leaf.data.mid()
+                    for at, got1 in got.items():
+                        sd = d.cols.all[at].div()
+                        mid1s.add((want[at] - mid1[at]) / sd)
+                        ks.add((want[at] - got1) / sd)
+        stats.report(somes)
+
+    def predicts(file=None):
+        d = DATA().adds(csv(file or the.train)).shuffle()
+        tests, train = d.rows[:10], d.rows[10:]
+        for test in tests:
+            for at, got in d.predict(test, train, cols=d.cols.y, k=5).items():
+                want = test[at]
+                print(at, r3(abs(got - want) / d.cols.all[at].div()))
+
+    def _MQS():
+        for i, arg in enumerate(sys.argv):
+            if arg[-4:] == ".csv":
+                the.train = arg
+                random.seed(the.seed)
+                try:
+                    egs._mqs()
+                except Exception:
+                    traceback.print_stack()
+
+    def _mqs():
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 20
+        d = DATA().adds(csv(the.train))
+        b4 = sorted([d.distance(row) for row in d.rows])
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+        least = sorted([rnd(x) for x in b4])[0]
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"dull\t: {dull:.3f}")
+        print(f"least\t: {least:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for n in [15, 20, 25, 30, 50, 100]:
+            the.Last = n
+            rand = []
+            for _ in range(repeats):
+                some = d.shuffle().rows[:n]
+                d1 = d.clone().adds(some).distances()
+                rand += [rnd(d.distance(d1.rows[0]))]
+
+            start = time()
+            pool = [rnd(d.distance(d.shuffle().activeLearning()[0]))
+                    for _ in range(repeats)]
+            print(f"pool.{n}: {(time() - start) / repeats:.2f} secs")
+
+            generate1 = lambda best, rest: best.exploit(rest, 1000)
+            start = time()
+            mqs1000 = [
+                rnd(d.distance(d.shuffle().activeLearning(generate=generate1)[0]))
+                for _ in range(repeats)]
+            print(f"mqs1K.{n}: {(time - start) / repeats:.2f} secs")
+
+            used = {}
+            generate2 = lambda best, rest: best.exploit(rest, top=4, used=used)
+            start = time()
+            mqs4 = []
+            for _ in range(20):
+                tmp = d.shuffle().activeLearning(generate=generate2)
+                mqs4 += [rnd(d.distance(tmp[0]))]
+            for col in sorted(used.values(), key=lambda col: -col.n):
+                print(
+                    f"\tfeature,{col.n},\t{col.mid()},\t{col.div():.3f},\t{col.txt}")
+
+            print(f"mqs4.{n}: {(time() - start) / repeats:.2f} secs")
+
+            somes += [stats.SOME(rand, f"random,{n}"),
+                      stats.SOME(pool, f"pool,{n}"),
+                      stats.SOME(mqs4, f"mqs4,{n}"),
+                      stats.SOME(mqs1000, f"mqs1000,{n}")]
+
+        stats.report(somes, 0.01)
+
+    def policies():
+        scoring_policies = [('exploit', lambda B, R,: exploit(B, R)),
+                            ('explore', lambda B, R: explore(B, R)),
+                            ('b2', lambda B, R: (B ** 2) / (R + 10 ** -30)),
+                            ('Random', lambda B, R: random.random()),
+                            ('FOCUS',
+                             lambda B, R: ((exp(B) + 1) ** normalized_exp(the.iter,
+                                                                          the.Last,
+                                                                          1) + (
+                                                   exp(R) + 1)) / (
+                                                  abs(exp(B) - exp(R)) + 10 ** -30)),
+                            ('ExpProgressive',
+                             lambda B, R: normalized_exp(the.iter, the.Last,
+                                                         0) * exploit(B, R) + (
+                                                  1 - normalized_exp(the.iter,
+                                                                     the.Last,
+                                                                     0)) * explore(B,
+                                                                                   R))]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 20
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40]:
+                start = time()
+                result = [rnd(d.distance(d.shuffle().activeLearning(score=how)[0]))
+                          for _ in range(repeats)]
+                print(f"{what}.{the.Last}: {(time() - start) / repeats:.2f} secs")
+                somes += [stats.SOME(result, f"{what} ,{the.Last}")]
+
+        stats.report(somes, 0.01)
+
+    def branch_2_4_6_8_10():
+        scoring_policies = [('FOCUS',
+                             lambda B, R: ((exp(B) + 1) ** normalized_exp(the.iter,
+                                                                          the.Last,
+                                                                          1) + (
+                                                   exp(R) + 1)) / (
+                                                  abs(exp(B) - exp(R)) + 10 ** -30)),
+                            ('UCB_GPM', 'UCB_GPM')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 10
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40]:
+                for the.branch in [True]:
+                    for the.Stop in [2, 4, 6, 8, 10]:
+                        start = time()
+                        result = []
+                        runs = 0
+                        for _ in range(repeats):
+                            tmp = d.shuffle().activeLearning(score=how)
+                            runs += len(tmp)
+                            result += [rnd(d.distance(tmp[0]))]
+
+                        pre = f"{what}/branch_{the.Stop}" if the.Last > 0 else "rrp"
+                        tag = f"{pre},{int(runs / repeats)}"
+                        print(tag, f": {(time() - start) / repeats:.2f} secs")
+                        somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def simple():
+        scoring_policies = [('exploit', lambda B, R,: B - R),
+                            ('explore', lambda B, R: (exp(B) + exp(R)) / (
+                                    1E-30 + abs(exp(B) - exp(R)))),
+                            ('random', lambda B, R: random.random())]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 20
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20]:
+                for the.branch in [False]:
+                    start = time()
+                    result = []
+                    runs = 0
+                    for _ in range(repeats):
+                        tmp = d.shuffle().activeLearning(score=how)
+                        runs += len(tmp)
+                        result += [rnd(d.distance(tmp[0]))]
+
+                    pre = f"{what}/rrp_slash1={the.branch}" if the.Last > 0 else \
+                        "rrp"
+                    tag = ((f"{the.train.split('/')[-1]}, {pre}, "
+                           f"{int(runs / repeats)}")
+                           + f", {(time() - start) / repeats:.2f} secs")
+                    somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def rrp_dull_True():
+        scoring_policies = [('exploit', lambda B, R,: B - R),
+                            ('explore', lambda B, R: (exp(B) + exp(R)) / (
+                                    1E-30 + abs(exp(B) - exp(R)))),
+                            ('random', lambda B, R: random.random()),
+                            ('FOCUS',
+                             lambda B, R: ((exp(B) + 1) ** normalized_exp(the.iter,
+                                                                          the.Last,
+                                                                          1) + (
+                                                   exp(R) + 1)) / (
+                                                  abs(exp(B) - exp(R)) + 10 ** -30)),
+                            ('UCB_Linear', 'UCB_Linear'),
+                            ('PI_Linear', 'PI_Linear'),
+                            ('EI_Linear', 'EI_Linear'),
+                            ('UCB_GPM', 'UCB_GPM')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 5
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        the.Dull = True
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40, 50, 60]:
+                for the.branch in [False, True]:
+                    start = time()
+                    result = []
+                    runs = 0
+                    for _ in range(repeats):
+                        tmp = d.shuffle().activeLearning(score=how)
+                        runs += len(tmp)
+                        result += [rnd(d.distance(tmp[0]))]
+
+                    pre = f"{what}/rrp_slash1={the.branch}" if the.Last > 0 else \
+                        "rrp"
+                    tag = ((f"{the.train.split('/')[-1]}, {pre}, "
+                           f"{int(runs / repeats)}")
+                           + f", {(time() - start) / repeats:.2f} secs")
+                    somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def fall_only_ucb():
+        scoring_policies = [('UCB_GPM', 'UCB_GPM')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 5
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        the.Dull = False
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40]:
+                for the.branch in [True, False]:
+                    start = time()
+                    result = []
+                    runs = 0
+                    for _ in range(repeats):
+                        tmp = d.shuffle().activeLearning(score=how)
+                        runs += len(tmp)
+                        result += [rnd(d.distance(tmp[0]))]
+
+                    pre = f"{what}/rr_slash1={the.branch}/{the.Last}" if (the.Last
+                                                                          > 0) \
+                        else "rrp"
+                    tag = f"{pre},{int(runs / repeats)}"
+                    print(tag, f": {(time() - start) / repeats:.2f} secs")
+                    somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def rank_all():
+        scoring_policies = [('exploit', lambda B, R,: B - R),
+                            ('explore', lambda B, R: (exp(B) + exp(R)) / (
+                                    1E-30 + abs(exp(B) - exp(R)))),
+                            ('random', lambda B, R: random.random()),
+                            ('FOCUS',
+                             lambda B, R: ((exp(B) + 1) ** normalized_exp(the.iter,
+                                                                          the.Last,
+                                                                          1) + (
+                                                   exp(R) + 1)) / (
+                                                  abs(exp(B) - exp(R)) + 10 ** -30))]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 20
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        the.Dull = False
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        the.full = True
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40]:
+                if the.Last == 20:
+                    text = '20+20'
+                if the.Last == 30:
+                    text = '30+10'
+                if the.Last == 40:
+                    text = '40+0'
+                start = time()
+                result = []
+                runs = 0
+                for _ in range(repeats):
+                    tmp = d.shuffle().activeLearning(score=how)
+                    runs += len(tmp)
+                    result += [rnd(d.distance(tmp[0]))]
+
+                pre = f"{what}/{text}" if the.Last > 0 else "rrp"
+                tag = f"{pre},{int(runs / repeats)}"
+                print(tag, f": {(time() - start) / repeats:.2f} secs")
+                somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def UCB_Linear_test():
+        scoring_policies = [('UCB_Linear', 'UCB_Linear'),
+                            ('PI_Linear', 'PI_Linear'),
+                            ('EI_Linear', 'EI_Linear'),
+                            ('random', lambda B, R: random.random())]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 10
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        the.Dull = False
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        the.Branch = False
+
+        for what, how in scoring_policies:
+            for the.Last in [40]:
+                for the.neg in [1, -1]:
+                    start = time()
+                    result = []
+                    runs = 0
+                    for _ in range(repeats):
+                        tmp = d.shuffle().activeLearning(score=how)
+                        runs += len(tmp)
+                        result += [rnd(d.distance(tmp[0]))]
+
+                    pre = f"{what}/coef={the.neg}" if the.Last > 0 else "rrp"
+                    tag = f"{pre},{int(runs / repeats)}"
+                    print(tag, f": {(time() - start) / repeats:.2f} secs")
+                    somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def branch_1_vs_2_point():
+        scoring_policies = [('exploit', lambda B, R,: B - R),
+                            ('explore', lambda B, R: (exp(B) + exp(R)) / (
+                                    1E-30 + abs(exp(B) - exp(R)))),
+                            ('random', lambda B, R: random.random()),
+                            ('UCB_Linear', 'UCB_Linear')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 10
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [20, 30, 40]:
+                for the.branch in [False, True, 'branch_2_point']:
+                    start = time()
+                    result = []
+                    runs = 0
+                    for _ in range(repeats):
+                        tmp = d.shuffle().activeLearning(score=how)
+                        runs += len(tmp)
+                        result += [rnd(d.distance(tmp[0]))]
+
+                    branch_text = 'random'
+                    if the.branch == True:
+                        branch_text = '1_point'
+                    if the.branch == 'branch_2_point':
+                        branch_text = '2_point'
+
+                    pre = f"{what}/{branch_text}"
+                    tag = f"{pre},{int(runs / repeats)}"
+                    print(tag, f": {(time() - start) / repeats:.2f} secs")
+                    somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def branch_depth():
+        scoring_policies = [('exploit', lambda B, R,: B - R),
+                            ('explore', lambda B, R: (exp(B) + exp(R)) / (
+                                    1E-30 + abs(exp(B) - exp(R)))),
+                            ('random', lambda B, R: random.random()),
+                            ('UCB_GPM', 'UCB_GPM')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 1
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [40]:
+                for the.branch in ['branch_2_point']:
+                    for the.Stop in [0, 4, 20, 40]:
+                        start = time()
+                        result = []
+                        runs = 0
+                        for _ in range(repeats):
+                            tmp = d.shuffle().activeLearning(score=how)
+                            runs += len(tmp)
+                            result += [rnd(d.distance(tmp[0]))]
+
+                        pre = f"{what}/{the.branch} depth={the.Stop}"
+                        tag = f"{pre},{int(runs / repeats)}"
+                        print(tag, f": {(time() - start) / repeats:.2f} secs")
+                        somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def kappa_decay():
+        scoring_policies = [('UCB_GPM', 'UCB_GPM')]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 10
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        for what, how in scoring_policies:
+            for the.Last in [40]:
+                for the.branch in ['branch_2_point']:
+                    the.Stop = 4
+                    for the.kdecay in [0, 0.5, 1]:
+                        start = time()
+                        result = []
+                        runs = 0
+                        for _ in range(repeats):
+                            tmp = d.shuffle().activeLearning(score=how)
+                            runs += len(tmp)
+                            result += [rnd(d.distance(tmp[0]))]
+
+                        pre = f"{what}/kdecay={the.kdecay}"
+                        tag = f"{pre},{int(runs / repeats)}"
+                        print(tag, f": {(time() - start) / repeats:.2f} secs")
+                        somes += [stats.SOME(result, tag)]
+
+        stats.report(somes, 0.01)
+
+    def mean_vs_median():
+        scoring_policies = [('exploit', lambda B, R,: B),
+                            ('Random', lambda B, R: random.random())]
+
+        print(the.train, flush=True, file=sys.stderr)
+        print("\n" + the.train)
+        repeats = 20
+        d = DATA().adds(csv(the.train))
+        b4 = [d.distance(row) for row in d.rows]
+        asIs, div = medianSd(b4)
+        dull = div * the.Cohen
+        rnd = lambda z: ((int(z / dull) * dull) if the.Dull else z)
+
+        print(f"asIs\t: {asIs:.3f}")
+        print(f"div\t: {div:.3f}")
+        print(f"rows\t: {len(d.rows)}")
+        print(f"xcols\t: {len(d.cols.x)}")
+        print(f"ycols\t: {len(d.cols.y)}\n")
+
+        somes = [stats.SOME(b4, f"asIs,{len(d.rows)}")]
+
+        the.branch == True
+
+        for what, how in scoring_policies:
+            for the.divide in [0, 1]:
+                divide = 'mean' if the.divide == 0 else 'median'
+                for the.Last in [20, 30, 40]:
+                    start = time()
+                    result = [
+                        rnd(d.distance(d.shuffle().activeLearning(score=how)[0]))
+                        for _ in range(repeats)]
+                    print(
+                        f"{what}/branch={divide}.{the.Last}: "
+                        f"{(time() - start) / repeats:.2f} secs")
+                    somes += [
+                        stats.SOME(result, f"{what}/branch={divide} ,{the.Last}")]
+
+        stats.report(somes, 0.01)
+
+
+# --------- --------- --------- --------- --------- --------- --------- ---------
+# --------
+# ## UCB with linear projections
+def get_cumulative_density(x, mean, sd):
+    cdf = lambda z: 1 - 0.5 * 2.718 ** (-0.717 * z - 0.416 * z * z)
+    z = (x - mean) / sd
+    return cdf(z) if z >= 0 else 1 - cdf(-z)
+
+
+def get_probability_density(x, mean, sd):
+    z = (x - mean) / sd
+    e = 2.718
+    return (0.399 / sd) * (e ** (-(z ** 2) / 2))
+
+
+def PI_score(mean, std, best_d2h):
+    exploit_explore_tradeoff = (
+        0.01  # The paper says that this has to be manually chosen.
+    )
+    m = (mean - best_d2h - exploit_explore_tradeoff) / (std + sys.float_info.min)
+    score = get_cumulative_density(m, mean, std)
+    return score
+
+
+# Expected improvement score
+def EI_score(mean, std, best_d2h):
+    exploit_explore_tradeoff = 0.01  # As recommended by Hoffman et al 2011
+    m = (mean - best_d2h - exploit_explore_tradeoff) / (std + sys.float_info.min)
+    cum_density_coeff = mean - best_d2h - exploit_explore_tradeoff
+    score = (cum_density_coeff * get_cumulative_density(m, mean, std)) + (
+            std * get_probability_density(m, mean, std)
+    )
+
+    return score
+
+
+def get_UCB_coefficients(lite_size, dark_size):
+    delta = 0.1
+    v = 1
+    D = lite_size + dark_size
+    # gamma = 2 * math.log((lite_size ** (dim / 2 + 2) * math.pi**2) / 3 * delta)
+    gamma = 2 * math.log((D * lite_size ** 2 * math.pi ** 2) / 6 * delta)
+    # revisit the std coeff
+    std_coeff = (v * gamma) ** 0.5
+    return std_coeff
+
+
+def UCB_plus_score(mean, std, lite_size, dark_size):
+    std_coeff = get_UCB_coefficients(lite_size, dark_size)
+    return mean + std_coeff * std
+
+
+def cosine_project(ab, ra, rb):
+    return (ab ** 2 + ra ** 2 - rb ** 2) / (2 * ab + sys.float_info.min)
+
+
+def get_interpolated_distance(dist_row_a, dist_row_b, dist_ab, d2h_a, d2h_b):
+    inconsistency = False
+    # Should we move these 3 lines into the cosine project fn?
+    projection_dist_a = cosine_project(dist_ab, dist_row_a, dist_row_b)
+    projection_dist_b = abs(dist_ab - projection_dist_a)
+    projection_dist_a = abs(cosine_project(dist_ab, dist_row_a, dist_row_b))
+
+    if (dist_row_a > dist_row_b) ^ (projection_dist_a > projection_dist_b):
+        # print(f"\n\nINCONSISTENCY OBSERVED!!!")
+        # print(f" dist_row_a: {dist_row_a}, dist_row_b: {dist_row_b}, dist_ab: {
+        # dist_ab}, projection_dist_a: {projection_dist_a}, projection_dist_b: {
+        # projection_dist_b} \n")
+        inconsistency = True
+
+    # Weight of 'a' should be higher if the projection is closer to a and farther
+    # away from b
+    a_weight = projection_dist_b / (projection_dist_a + projection_dist_b) if (
+                                                                                      projection_dist_a + projection_dist_b) != 0 else 0.5
+    b_weight = 1 - a_weight
+
+    d2h_row = (a_weight * d2h_a) + (b_weight * d2h_b)
+
+    return d2h_row, inconsistency
+
+
+def split_GP(self, dark, lite, acqn_fn):
+    max = -1e30
+    out = 1
+    total_count = 0
+    inconsistency_count = 0
+
+    random.shuffle(dark)
+    dark_subset = dark[:the.buffer]
+
+    for row in dark_subset:
+        best_d2h = self.distance(lite[0])
+        interpol_distances = []
+        for i in range(10):
+            total_count += 1
+            # randomly pick 2 elements in lite and find the d2hs of these 2 elements.
+            indices = random.sample(range(len(lite)), 2)
+            a, b = lite[indices[0]], lite[indices[1]]
+            dist_row_a, dist_row_b, dist_ab = (
+                self.dist(a, row),
+                self.dist(b, row),
+                self.dist(a, b),
+            )
+            distance, inconsistency = get_interpolated_distance(
+                dist_row_a, dist_row_b, dist_ab, self.distance(a), self.distance(b)
+            )
+            if inconsistency:
+                inconsistency_count += 1
+            interpol_distances.append(distance)
+
+        mean, std = np.mean(interpol_distances), np.std(interpol_distances) + 0.0001
+
+        if acqn_fn == 'UCB':
+            tmp = UCB_plus_score(the.neg * mean, std, len(lite), len(dark))
+        if acqn_fn == 'PI':
+            tmp = tmp = PI_score(the.neg * mean, std, best_d2h)
+        if acqn_fn == 'EI':
+            tmp = EI_score(the.neg * mean, std, best_d2h)
+
+        if tmp > max:
+            out, max = row, tmp
+
+    return out
+
+
+def UCB_Linear(d, todo, done):
+    while len(todo) > 2 and len(done) < the.Last:
+        top = split_GP(d, todo, done, 'UCB')
+        todo.remove(top)
+        done += [top]
+        done = d.ranked(done)
+    return done
+
+
+def PI_Linear(d, todo, done):
+    while len(todo) > 2 and len(done) < the.Last:
+        top = split_GP(d, todo, done, 'PI')
+        todo.remove(top)
+        done += [top]
+        done = d.ranked(done)
+    return done
+
+
+def EI_Linear(d, todo, done):
+    while len(todo) > 2 and len(done) < the.Last:
+        top = split_GP(d, todo, done, 'EI')
+        todo.remove(top)
+        done += [top]
+        done = d.ranked(done)
+    return done
+
+
+# --------- --------- --------- --------- --------- --------- --------- ---------
+# --------
+# ## Gaussian Process UCB (Sklearn)
+
+import numpy as np
+from sklearn.preprocessing import StandardScaler, OneHotEncoder
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.gaussian_process import GaussianProcessRegressor
+from sklearn.gaussian_process.kernels import RBF, ConstantKernel as C
+
+from scipy.optimize import fmin_l_bfgs_b
+
+import warnings
+from sklearn.exceptions import ConvergenceWarning
+
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+warnings.filterwarnings("ignore",
+                        message="Predicted variances smaller than 0. Setting those "
+                                "variances to 0.")
+
+
+def SimAnneal(d, todo, done):
+    return lambda B, R: ((exp(B) + 1) ** normalized_exp(
+        the.iter, the.Last, 1) + (exp(R) + 1)) / (
+                                abs(exp(B) - exp(
+                                    R)) + 10 ** -30)
+
+
+def UCB_GPM(d, todo, done):
+    kernel = C(1.0, (1e-8, 1e8)) * RBF(1.0, (1e-8, 1e8))
+    gp = GaussianProcessRegressor(kernel=kernel, n_restarts_optimizer=10)
+
+    num_indexes = [col.at for col in d.cols.x if type(col) == NUM]
+    sym_indexes = [col.at for col in d.cols.x if type(col) == SYM]
+
+    num_transformer = StandardScaler()
+    cat_transformer = OneHotEncoder(handle_unknown='ignore', sparse_output=False)
+
+    preprocessor = ColumnTransformer(
+        transformers=[
+            ('num', num_transformer, num_indexes),
+            ('cat', cat_transformer, sym_indexes)])
+    
+    # Add this line to define the pipeline
+    pipeline = Pipeline(steps=[('preprocessor', preprocessor)])
+
+    if sym_indexes:
+        cat_data = np.array([[str(row[idx]) for idx in sym_indexes] for row in done],
+                            dtype=object)
+        cat_transformer.fit(cat_data)
+
+    def custom_optimizer(obj_func, initial_theta, bounds):
+        theta_opt, func_min, _ = fmin_l_bfgs_b(obj_func, initial_theta,
+                                               bounds=bounds, maxiter=1000)
+        return theta_opt, func_min
+
+    gp.optimizer = custom_optimizer
+
+    def update_gp_model(done_set):
+        X_done = np.array([x for x in done_set], dtype=object)
+        y_done = np.array([-d.distance(x) for x in done_set])
+        X_done_transformed = pipeline.fit_transform(X_done)
+        gp.fit(X_done_transformed, y_done)
+
+    def ucb(x, kappa):
+        x = np.array(x).reshape(1, -1).astype(object)
+        x_transformed = pipeline.transform(x)
+        mean, std = gp.predict(x_transformed, return_std=True)
+        return mean + kappa * std
+
+    while todo and len(done) < the.Last:
+        update_gp_model(done)
+        random.shuffle(todo)
+        todo_subset = todo[:the.buffer]
+        delta = 0.1
+        kappa = 2 * math.log(
+            (len(d.cols.x) * len(done) ** 2 * math.pi ** 2) / 6 * delta)
+
+        ucb_values = [ucb(row, kappa ** 0.5) for row in todo_subset]
+        best_idx = np.argmax(ucb_values)
+        best_candidate = todo.pop(best_idx)
+
+        done.append(best_candidate)
+
+    if the.full == True:
+        update_gp_model(done)
+        random.shuffle(todo)
+        todo_subset = todo[:1000]
+
+        kappa = 2 * math.log(
+            (len(d.cols.x) * len(done) ** 2 * math.pi ** 2) / 6 * delta)
+
+        ucb_values = [ucb(row, kappa ** 0.5) for row in todo_subset]
+
+        for _ in range(40 - the.Last):
+            best_idx = np.argmax(ucb_values)
+            best_candidate = todo.pop(best_idx)
+            done.append(best_candidate)
+
+    # print(len(d.rows))
+    return done
+
+
+## Main
+the = SETTINGS(__doc__)
+if __name__ == "__main__" and len(sys.argv) > 1:
+    the.cli()
+    random.seed(the.seed)
+    getattr(egs, the.eg, lambda: print(f"ezr: [{the.eg}] unknown."))()
