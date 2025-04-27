@@ -1,18 +1,18 @@
 xcols,ycols,rows,file
-14,1,3456,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/misc/HSMGP_num.csv
-14,1,3456,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/HSMGP_num.csv
-17,2,53662,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-N.csv
-11,2,972,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-O.csv
-11,2,86058,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-X.csv
-17,3,864,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-M.csv
-11,2,1023,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-L.csv
-16,2,6840,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-V.csv
-16,2,65536,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-W.csv
-12,2,5184,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-T.csv
-11,2,1023,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-P.csv
-13,3,2736,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-Q.csv
-16,1,1152,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/X264_AllMeasurements.csv
-14,2,3008,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-R.csv
-16,1,499,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/old/china.csv
-14,2,1121,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/accessories.csv
-17,5,1000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/coc1000.csv
+14,1,3456,/Users/vilkomira21/My Drive/NSGA_III/data/misc/HSMGP_num.csv
+14,1,3456,/Users/vilkomira21/My Drive/NSGA_III/data/config/HSMGP_num.csv
+17,2,53662,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-N.csv
+11,2,972,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-O.csv
+11,2,86058,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-X.csv
+17,3,864,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-M.csv
+11,2,1023,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-L.csv
+16,2,6840,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-V.csv
+16,2,65536,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-W.csv
+12,2,5184,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-T.csv
+11,2,1023,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-P.csv
+13,3,2736,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-Q.csv
+16,1,1152,/Users/vilkomira21/My Drive/NSGA_III/data/config/X264_AllMeasurements.csv
+14,2,3008,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-R.csv
+16,1,499,/Users/vilkomira21/My Drive/NSGA_III/data/old/china.csv
+14,2,1121,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/accessories.csv
+17,5,1000,/Users/vilkomira21/My Drive/NSGA_III/data/process/coc1000.csv

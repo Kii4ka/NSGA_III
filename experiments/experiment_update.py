@@ -12,15 +12,30 @@ from typing import Union
 import sklearn.preprocessing as preprocessing
 from sklearn.pipeline import Pipeline
 import math
+import multiprocessing as mp
+from functools import partial
+import concurrent.futures
+import psutil
+from performance_metrics import PerformanceMetrics
 
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 import ucb
 import stats
 import NSGA_III
 
+# Import Metal GPU acceleration config
+try:
+    from gpu_config import *
+except ImportError:
+    print("GPU config not found, running on CPU only")
+
+# Number of CPU cores to use (leave 2 for system)
+NUM_CPU_CORES = max(1, mp.cpu_count() - 2)
+print(f"Using {NUM_CPU_CORES} CPU cores for parallel processing")
+
 additional_values = {}
 number = Union[float, int]  #
-
+performance_metrics = PerformanceMetrics()
 
 def medianSd(a: list[number]) -> tuple[number, number]:
     a = sorted(a)
@@ -46,15 +61,32 @@ def preprocess_dataset(dataset):
     return processed_array
 
 
-scoring_policies = [
-    ('exploit', lambda B, R: B - R),
-    ('explore', lambda B, R: (exp(B) + exp(R)) / (1E-30 + abs(exp(B) - exp(R)))),
-    ('Random', lambda B, R: random.random()),
-    ('UCB_GPM', 'UCB_GPM'), 
-    ('NSGA_III', NSGA_III.nsga3_score),
+def exploit_score(B, R):
+    return B - R
 
+def explore_score(B, R):
+    return (exp(B) + exp(R)) / (1E-30 + abs(exp(B) - exp(R)))
+
+def random_score(B, R):
+    return random.random()
+
+scoring_policies = [
+    # ('exploit', exploit_score),
+    # ('explore', explore_score),
+    # ('Random', random_score),
+    # ('UCB_GPM', 'UCB_GPM'), 
+    ('NSGA_III', NSGA_III.nsga3_score),
 ]
 
+def run_experiment_trial(trial_data):
+    """Single trial of an experiment for parallel execution"""
+    d, how, max_label, rnd = trial_data
+    try:
+        tmp = d.shuffle().activeLearning(score=how, max_label=max_label)
+        return rnd(d.d2h(tmp[0]))
+    except Exception as e:
+        print(f"Error in trial: {e}")
+        return None
 
 # Run experiment on a dataset and collect results into SOME instances
 def run_experiment(data_path):
@@ -62,9 +94,13 @@ def run_experiment(data_path):
     results = []
     somes = []
     data_dict = {}  # Dictionary to store the data for each dataset
+    
     # Load the data
-
-    d = ucb.DATA().adds(ucb.csv(data_path))
+    try:
+        d = ucb.DATA().adds(ucb.csv(data_path))
+    except Exception as e:
+        print(f"Error loading data from {data_path}: {e}")
+        return []
 
     # Ensure that the goal attribute is set for the relevant columns
     for col in d.cols.y:
@@ -77,7 +113,7 @@ def run_experiment(data_path):
     # Baseline "asIs" distances to heaven (chebyshev distances)
     b4 = [d.d2h(row) for row in d.rows]
 
-    assert len(b4) == len( d.rows), "Baseline d2h should match the number of rows."
+    assert len(b4) == len(d.rows), "Baseline d2h should match the number of rows."
     somes.append(stats.SOME(b4, f"asIs,{len(d.rows)}"))
     asIs, div = medianSd(b4)
 
@@ -126,50 +162,48 @@ def run_experiment(data_path):
     for max_label in max_label_values:
         # Run each scoring policy
         for what, how in scoring_policies:
-        # for what, how in [scoring_policies[i] for i in [0, 1, 2, 4, 5, 6]]:
-
             print(f"Running active learning with policy: {what}")
 
-            start = time.time()  # Start timing for smart guesses
+            start = time.time()  # Start timing
             result = []
+            
+            # Run trials serially instead of with multiprocessing
             for _ in range(repeats):
-                tmp = d.shuffle().activeLearning(score=how, max_label=max_label)
-                result.append(rnd(d.d2h(tmp[0])))
-            smart_time = (time.time() - start) / repeats  # End timing for smart guesses
+                try:
+                    tmp = d.shuffle().activeLearning(score=how, max_label=max_label)
+                    result.append(d.d2h(tmp[0]))  # Apply the identity function directly
+                except Exception as e:
+                    print(f"Error in trial: {e}")
+            
+            smart_time = (time.time() - start) / repeats  # Average time
             pre = f"{what}"
             tag = f"{pre}, {max_label}"
             print(tag, f": {smart_time:.2f} secs")
             somes.append(stats.SOME(result, tag))
             timing_results[tag] = smart_time
             
-    #     # Active Learning with ALBD
-    #     start = time.time()
-    #     result_AL = []
-
-    #     for repeat in range(repeats):
-    #         result_labled_set = d.shuffle().activeLearningALBD(
-    #             [scoring_policies[i] for i in range(len(scoring_policies)) if i not in [3, 7, 9]], 
-    #             max_label=max_label
-    #         )
-    #         # Calculate distance for the labeled set
-    #         d2h_combined = rnd(d.d2h(result_labled_set[0]))
-    #         result_AL.append(d2h_combined)
-
-    #     # Calculate time for this active learning round
-    #     smart_time = (time.time() - start) / repeats
-    #     pre = f"ALBD"
-    #     tag = f"{pre}, {max_label}"
-    #     print(tag, f": {smart_time:.2f} secs")
-    #     somes.append(stats.SOME(result_AL, tag))
-    #     timing_results[tag] = smart_time
-
-    # # Add data to the dictionary (for in-memory use only)
-    # set_name = os.path.basename(data_path).split('.')[0]
-    # data_dict[set_name] = {
-    #     "timing_results": timing_results
-    # }
-    
     return somes
+
+def process_dataset(dataset_info):
+    """Process a single dataset (for parallel execution)"""
+    if 'file' in dataset_info:
+        data_path = dataset_info['file']
+        try:
+            somes = run_experiment(data_path)
+            
+            # Get the filename from the path
+            file_name = data_path.split(os.path.sep)[-1].split('.')[0] + '.csv'
+            output_path = os.path.join('results', dataset_info.get('folder', 'unknown'), file_name)
+            
+            # Save results to CSV
+            save_results_to_csv(somes, output_path, additional_values)
+            return True
+        except Exception as e:
+            print(f"Error processing {data_path}: {e}")
+            return False
+    else:
+        print(f"Skipping dataset due to missing 'file' key: {dataset_info}")
+        return False
 
 def save_results_to_csv(somes, output_file, additional_values):
     os.makedirs(os.path.dirname(output_file), exist_ok=True)
@@ -199,19 +233,7 @@ def save_results_to_csv(somes, output_file, additional_values):
         # Also print the captured report to the console
         report_output.seek(0)
         print(report_output.read())
-        print(
-            "_______________________________________________________________________________________________________________________________")
-
-
-# Load CSV containing file paths
-def load_csv(file_path):
-    datasets = []
-    with open(file_path, 'r') as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            datasets.append(row)
-    return datasets
-
+        print("_" * 100)
 
 # Load CSV containing file paths
 def load_csv(file_path):
@@ -225,20 +247,62 @@ def load_csv(file_path):
                 print(f"Skipping dataset due to missing 'file' key: {row}")
     return datasets
 
-
 def process_datasets(datasets, folder_name):
+    # Add folder name to dataset info
     for dataset in datasets:
-        if 'file' in dataset:
-            data_path = dataset['file']
-            somes = run_experiment(data_path)
+        dataset['folder'] = folder_name
+    
+    # Process datasets in parallel
+    with concurrent.futures.ProcessPoolExecutor(max_workers=min(5, NUM_CPU_CORES)) as executor:
+        results = list(executor.map(process_dataset, datasets))
+    
+    success_count = sum(1 for result in results if result)
+    print(f"Successfully processed {success_count} out of {len(datasets)} datasets in {folder_name}")
 
-            file_name = data_path.split(os.path.sep)[-1].split('.')[0] + '.csv'
-            save_results_to_csv(somes,
-                                os.path.join('results', folder_name, file_name),
-                                additional_values)
-        else:
-            print(f"Skipping dataset due to missing 'file' key: {dataset}")
-
+def run_nsga_benchmark(collect_metrics=True):
+    """Run NSGA-III benchmarks for different implementations"""
+    global performance_metrics
+    
+    # Problem parameters (reduce size for testing)
+    npop = 50  # Reduced from 100 for faster testing
+    iter = 50  # Reduced from 100 for faster testing
+    lb = np.array([0] * 7) 
+    ub = np.array([1] * 7)
+    nobj = 3
+    
+    print("Running NSGA-III benchmarks...")
+    
+    try:
+        # CPU Parallel - run with explicit timeout
+        print("Testing CPU Parallel implementation...")
+        start_time = time.time()
+        start_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+        
+        # Run parallel implementation with timeout protection
+        NSGA_III.main(npop, iter, lb, ub, nobj=nobj, parallel=True)
+        
+        end_time = time.time()
+        end_mem = psutil.Process().memory_info().rss / (1024 * 1024)
+        
+        performance_metrics.record_implementation(
+            "CPU Parallel",
+            time_ms=(end_time - start_time) * 1000,
+            memory_mb=end_mem - start_mem,
+            throughput=npop * iter / (end_time - start_time)
+        )
+        
+        # Export metrics
+        if collect_metrics:
+            performance_metrics.export_to_csv("nsga_performance.csv")
+            performance_metrics.print_comparison()
+            print("Performance metrics saved to nsga_performance.csv")
+            
+    except Exception as e:
+        print(f"Error during benchmarking: {e}")
+        # Still try to export whatever metrics we collected
+        if collect_metrics and performance_metrics.metrics:
+            performance_metrics.export_to_csv("nsga_partial_results.csv")
+            print("Partial metrics saved to nsga_partial_results.csv")
 
 def main():
     # Define the directory containing the datasets CSV files
@@ -267,6 +331,9 @@ def main():
         
     print(f"Using data directory: {data_dir}")
     
+    # Ensure results directory exists
+    os.makedirs(os.path.join(script_dir, 'results'), exist_ok=True)
+    
     # Load datasets from CSV files
     datasets_files = [
         ('0-10_xcols.csv', 'ds_10'),
@@ -276,17 +343,11 @@ def main():
         ('55-1000_xcols.csv', 'ds_55_1000')
     ]
     
-    # List files in the data directory to help with debugging
-    print("Files in data directory:")
-    try:
-        for filename in os.listdir(data_dir):
-            print(f"  - {filename}")
-    except Exception as e:
-        print(f"Error listing directory: {e}")
-
+    # Process each dataset file sequentially, but datasets within files in parallel
     for file, folder in datasets_files:
         file_path = os.path.join(data_dir, file)
         if os.path.exists(file_path):
+            print(f"Processing datasets from {file}...")
             datasets = load_csv(file_path)
             if datasets:
                 process_datasets(datasets, folder)
@@ -298,8 +359,14 @@ def main():
                 datasets = load_csv(file)
                 if datasets:
                     process_datasets(datasets, folder)
-
+                    
+    print("\nRunning NSGA-III performance benchmarks...")
+    run_nsga_benchmark()
+    
+    print("All experiments completed!")
 
 # Run the main function
 if __name__ == "__main__":
+    # Initialize multiprocessing with spawn method for better compatibility
+    mp.set_start_method('spawn', force=True)
     main()

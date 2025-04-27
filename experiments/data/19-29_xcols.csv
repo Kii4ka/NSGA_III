@@ -1,15 +1,15 @@
 xcols,ycols,rows,file
-21,2,4608,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/config/SS-U.csv
-20,2,2938,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Life Expectancy Data.csv
-29,4,736,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/mxmh_survey_results.csv
-26,1,81,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/player_statistics_cleaned_final.csv
-20,2,913,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/dress-up.csv
-20,1,350,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/socks.csv
-22,2,247,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/wallpaper.csv
-19,2,7043,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/WA_Fn-UseC_-Telco-Customer-Churn.csv
-19,4,10127,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/BankChurners.csv
-23,4,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/xomo_ground.csv
-22,4,93,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/nasa93dem.csv
-23,4,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/xomo_osp2.csv
-23,4,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/xomo_osp.csv
-23,4,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/process/xomo_flight.csv
+21,2,4608,/Users/vilkomira21/My Drive/NSGA_III/data/config/SS-U.csv
+20,2,2938,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/Life Expectancy Data.csv
+29,4,736,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/mxmh_survey_results.csv
+26,1,81,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/player_statistics_cleaned_final.csv
+20,2,913,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/dress-up.csv
+20,1,350,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/socks.csv
+22,2,247,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/wallpaper.csv
+19,2,7043,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/WA_Fn-UseC_-Telco-Customer-Churn.csv
+19,4,10127,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/BankChurners.csv
+23,4,10000,/Users/vilkomira21/My Drive/NSGA_III/data/process/xomo_ground.csv
+22,4,93,/Users/vilkomira21/My Drive/NSGA_III/data/process/nasa93dem.csv
+23,4,10000,/Users/vilkomira21/My Drive/NSGA_III/data/process/xomo_osp2.csv
+23,4,10000,/Users/vilkomira21/My Drive/NSGA_III/data/process/xomo_osp.csv
+23,4,10000,/Users/vilkomira21/My Drive/NSGA_III/data/process/xomo_flight.csv

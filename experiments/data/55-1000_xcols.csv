@@ -1,11 +1,8 @@
 xcols,ycols,rows,file
-77,4,1460,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/home_data_for_ml_course.csv
-192,1,60000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/imagenet8_small.csv
-55,2,17737,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/all_players.csv
-64,1,25000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/Medical_Data_and_Hospital_Readmissions.csv
-784,1,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/mnist_1.csv
-784,1,60000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/add_dim/mnist_2.csv
-124,3,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/binary_config/Scrum10k.csv
-124,3,1000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/binary_config/Scrum1k.csv
-124,3,100000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/binary_config/Scrum100k.csv
-88,3,10000,/Users/vilkomira21/My Drive/NCSU/Spring_2025/CSC548_Parallel_systems/Final Project Report/NSGA-III/data/binary_config/billing10k.csv
+77,4,1460,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/home_data_for_ml_course.csv
+55,2,17737,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/all_players.csv
+64,1,25000,/Users/vilkomira21/My Drive/NSGA_III/data/add_dim/Medical_Data_and_Hospital_Readmissions.csv
+124,3,10000,/Users/vilkomira21/My Drive/NSGA_III/data/binary_config/Scrum10k.csv
+124,3,1000,/Users/vilkomira21/My Drive/NSGA_III/data/binary_config/Scrum1k.csv
+124,3,100000,/Users/vilkomira21/My Drive/NSGA_III/data/binary_config/Scrum100k.csv
+88,3,10000,/Users/vilkomira21/My Drive/NSGA_III/data/binary_config/billing10k.csv

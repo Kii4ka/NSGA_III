@@ -12,12 +12,43 @@ from collections import Counter
 from itertools import combinations
 from scipy.linalg import LinAlgError
 from scipy.spatial.distance import cdist
-import sys, os
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+import sys, os, time
+from contextlib import contextmanager
+import psutil
 
+sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+
+# Import Metal GPU acceleration config
+try:
+    from gpu_config import *
+except ImportError:
+    print("GPU config not found, running on CPU only")
+
+# Multiprocessing for parallel operations
+import multiprocessing as mp
+from functools import partial
+
+# Number of CPU cores to use (leave 2 free for system)
+NUM_CPU_CORES = max(1, mp.cpu_count() - 2)
+
+try:
+    from performance_metrics import PerformanceMetrics
+except ImportError:
+    # Define a minimal version if the file doesn't exist
+    class PerformanceMetrics:
+        def __init__(self): 
+            self.metrics = {}
+        def record_implementation(self, *args, **kwargs): pass
+        def export_to_csv(self, *args): pass
+        def print_comparison(self): pass
+
+def parallel_objective_calc(pop_chunk, nobj):
+    """Calculate objectives for a chunk of the population"""
+    return cal_obj(pop_chunk, nobj)
 
 def cal_obj(pop, nobj):
-    # DTLZ1
+    # DTLZ1 - vectorized for better performance
     g = 100 * (pop.shape[1] - nobj + 1 + np.sum((pop[:, nobj - 1:] - 0.5) ** 2 - np.cos(20 * np.pi * (pop[:, nobj - 1:] - 0.5)), axis=1))
     objs = np.zeros((pop.shape[0], nobj))
     temp_pop = pop[:, : nobj - 1]
@@ -29,14 +60,12 @@ def cal_obj(pop, nobj):
         objs[:, i] = f
     return objs
 
-
 def factorial(n):
     # calculate n!
     if n == 0 or n == 1:
         return 1
     else:
         return n * factorial(n - 1)
-
 
 def combination(n, m):
     # choose m elements from an n-length set
@@ -46,7 +75,6 @@ def combination(n, m):
         return 0
     else:
         return factorial(n) // (factorial(m) * factorial(n - m))
-
 
 def reference_points(npop, nvar):
     # calculate approximately npop uniformly distributed reference points on nvar dimensions
@@ -65,7 +93,6 @@ def reference_points(npop, nvar):
             temp_points = temp_points / 2 + 1 / (2 * nvar)
             points = np.concatenate((points, temp_points), axis=0)
     return points
-
 
 def nd_sort(objs):
     # fast non-domination sort
@@ -106,7 +133,6 @@ def nd_sort(objs):
     pfs.pop(ind)
     return pfs, rank
 
-
 def selection(pop, pc, rank, k=2):
     # binary tournament selection
     (npop, nvar) = pop.shape
@@ -120,7 +146,6 @@ def selection(pop, pc, rank, k=2):
         else:
             mating_pool[i] = pop[ind2]
     return mating_pool
-
 
 def crossover(mating_pool, lb, ub, pc, eta_c):
     # simulated binary crossover (SBX)
@@ -144,7 +169,6 @@ def crossover(mating_pool, lb, ub, pc, eta_c):
     offspring = np.max((offspring, np.tile(lb, (noff, 1))), axis=0)
     return offspring
 
-
 def mutation(pop, lb, ub, pm, eta_m):
     # polynomial mutation
     (npop, nvar) = pop.shape
@@ -162,9 +186,9 @@ def mutation(pop, lb, ub, pm, eta_m):
     pop = np.max((pop, lb), axis=0)
     return pop
 
-
 def environmental_selection(pop, objs, zmin, npop, V):
-    # NSGA-III environmental selection
+    """NSGA-III environmental selection with enhanced performance"""
+    # Original implementation with improved array operations
     pfs, rank = nd_sort(objs)
     nobj = objs.shape[1]
     selected = np.full(pop.shape[0], False)
@@ -174,7 +198,7 @@ def environmental_selection(pop, objs, zmin, npop, V):
         ind += 1
     K = npop - np.sum(selected)
 
-    # select the remaining K solutions
+    # Select the remaining K solutions
     objs1 = objs[selected]
     objs2 = objs[pfs[ind]]
     npop1 = objs1.shape[0]
@@ -183,34 +207,39 @@ def environmental_selection(pop, objs, zmin, npop, V):
     temp_objs = np.concatenate((objs1, objs2), axis=0)
     t_objs = temp_objs - zmin
 
-    # extreme points
-    extreme = np.zeros(nobj)
+    # Extreme points
+    extreme = np.zeros(nobj, dtype=int)
     w = 1e-6 + np.eye(nobj)
     for i in range(nobj):
         extreme[i] = np.argmin(np.max(t_objs / w[i], axis=1))
 
-    # intercepts
+    # Intercepts with improved error handling
     try:
-        hyperplane = np.matmul(np.linalg.inv(t_objs[extreme.astype(int)]), np.ones((nobj, 1)))
-        if np.any(hyperplane == 0):
+        hyperplane = np.linalg.solve(t_objs[extreme], np.ones(nobj))
+        if np.any(hyperplane <= 0) or np.any(np.isinf(hyperplane)):
             a = np.max(t_objs, axis=0)
         else:
             a = 1 / hyperplane
-    except LinAlgError:
+    except (LinAlgError, ValueError):
         a = np.max(t_objs, axis=0)
-    t_objs /= a.reshape(1, nobj)
+    
+    # Avoid division by zero
+    a = np.maximum(a, 1e-10)
+    t_objs = t_objs / a.reshape(1, nobj)
 
-    # association
+    # Association - vectorized operations
     cosine = 1 - cdist(t_objs, V, 'cosine')
-    distance = np.sqrt(np.sum(t_objs ** 2, axis=1).reshape(npop1 + npop2, 1)) * np.sqrt(1 - cosine ** 2)
+    norm_t = np.sqrt(np.sum(t_objs**2, axis=1)).reshape(-1, 1)
+    distance = norm_t * np.sqrt(np.maximum(0, 1 - cosine**2))
     dis = np.min(distance, axis=1)
     association = np.argmin(distance, axis=1)
+    
     temp_rho = dict(Counter(association[: npop1]))
     rho = np.zeros(nv)
     for key in temp_rho.keys():
         rho[key] = temp_rho[key]
 
-    # selection
+    # Selection
     choose = np.full(npop2, False)
     v_choose = np.full(nv, True)
     while np.sum(choose) < K:
@@ -227,9 +256,9 @@ def environmental_selection(pop, objs, zmin, npop, V):
             rho[j] += 1
         else:
             v_choose[j] = False
+            
     selected[np.array(pfs[ind])[choose]] = True
     return pop[selected], objs[selected], rank[selected]
-
 
 def nsga3_score(B, R, iteration=None, max_label=None):
     """
@@ -417,10 +446,10 @@ def nsga3_score(B, R, iteration=None, max_label=None):
     
     return score
 
-
-def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20):
+def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20, parallel=True, 
+         collect_metrics=True, export_csv=True):
     """
-    The main function
+    The main function with parallelization and metrics collection
     :param npop: population size
     :param iter: iteration number
     :param lb: lower bound
@@ -430,34 +459,88 @@ def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20):
     :param pm: mutation probability (default = 1)
     :param eta_c: spread factor distribution index (default = 30)
     :param eta_m: perturbance factor distribution index (default = 20)
+    :param parallel: whether to use parallel processing (default = True)
+    :param collect_metrics: whether to collect performance metrics (default = True)
+    :param export_csv: whether to export metrics to CSV (default = True)
     :return:
     """
+    # Initialize performance metrics
+    metrics = PerformanceMetrics() if collect_metrics else None
+    
+    # Timing stats
+    process = psutil.Process()
+    start_mem = process.memory_info().rss / (1024 * 1024)  # MB
+    start_time = time.time()
+    
     # Step 1. Initialization
     nvar = len(lb)  # the dimension of decision space
     pop = np.random.uniform(lb, ub, (npop, nvar))  # population
-    objs = cal_obj(pop, nobj)  # objectives
+    
+    # Calculate objectives - potentially in parallel
+    if parallel and npop > 50 and NUM_CPU_CORES > 1:
+        # Split population into chunks for parallel processing
+        chunk_size = npop // NUM_CPU_CORES
+        if chunk_size < 1:
+            chunk_size = 1
+        chunks = [pop[i:i+chunk_size] for i in range(0, npop, chunk_size)]
+        
+        # Process in parallel
+        with mp.Pool(processes=NUM_CPU_CORES) as pool:
+            results = pool.map(partial(parallel_objective_calc, nobj=nobj), chunks)
+        
+        # Combine results
+        objs = np.vstack(results)
+    else:
+        objs = cal_obj(pop, nobj)  # objectives
+    
     V = reference_points(npop, nobj)  # reference vectors
     zmin = np.min(objs, axis=0)  # ideal points
     [pfs, rank] = nd_sort(objs)  # Pareto rank
 
     # Step 2. The main loop
     for t in range(iter):
-
+        iter_start = time.time()
+        
         if (t + 1) % 50 == 0:
-            print('Iteration: ' + str(t + 1) + ' completed.')
+            print(f'Iteration: {t + 1}/{iter} completed. Time: {time.time() - iter_start:.2f}s')
 
         # Step 2.1. Mating selection + crossover + mutation
         mating_pool = selection(pop, pc, rank)
         off = crossover(mating_pool, lb, ub, pc, eta_c)
         off = mutation(off, lb, ub, pm, eta_m)
-        off_objs = cal_obj(off, nobj)
+        
+        # Calculate offspring objectives - potentially in parallel
+        if parallel and off.shape[0] > 50 and NUM_CPU_CORES > 1:
+            chunk_size = off.shape[0] // NUM_CPU_CORES
+            if chunk_size < 1:
+                chunk_size = 1
+            chunks = [off[i:i+chunk_size] for i in range(0, off.shape[0], chunk_size)]
+            
+            # Process in parallel
+            with mp.Pool(processes=NUM_CPU_CORES) as pool:
+                results = pool.map(partial(parallel_objective_calc, nobj=nobj), chunks)
+            
+            # Combine results
+            off_objs = np.vstack(results)
+        else:
+            off_objs = cal_obj(off, nobj)
 
         # Step 2.2. Environmental selection
         zmin = np.min((zmin, np.min(off_objs, axis=0)), axis=0)
-        pop, objs, rank = environmental_selection(np.concatenate((pop, off), axis=0), np.concatenate((objs, off_objs), axis=0), zmin, npop, V)
+        pop, objs, rank = environmental_selection(
+            np.concatenate((pop, off), axis=0), 
+            np.concatenate((objs, off_objs), axis=0), 
+            zmin, npop, V
+        )
+
+    # Print total time
+    total_time = time.time() - start_time
+    print(f"Total runtime: {total_time:.2f} seconds")
 
     # Step 3. Sort the results
     pf = objs[rank == 0]
+    
+    # Visualization code remains the same
     ax = plt.figure().add_subplot(111, projection='3d')
     ax.view_init(45, 45)
     x = [o[0] for o in pf]
@@ -470,7 +553,37 @@ def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20):
     plt.title('The Pareto front of DTLZ1')
     plt.savefig('Pareto front')
     plt.show()
-
+    
+    # At the end of the function, record metrics
+    if collect_metrics and metrics:
+        end_time = time.time()
+        end_mem = process.memory_info().rss / (1024 * 1024)  # MB
+        
+        total_time_ms = (end_time - start_time) * 1000
+        memory_usage = end_mem - start_mem
+        throughput = npop * iter / (end_time - start_time)
+        
+        implementation_name = "CPU Sequential"
+        if parallel:
+            implementation_name = "CPU Parallel"
+            
+        # Record the metrics
+        metrics.record_implementation(
+            implementation_name,
+            time_ms=total_time_ms, 
+            memory_mb=memory_usage,
+            throughput=throughput
+        )
+        
+        # Export metrics to CSV
+        if export_csv:
+            metrics.export_to_csv("nsga_performance.csv")
+            
+        # Print comparison
+        metrics.print_comparison()
+    
+    return pop, objs, rank, metrics if collect_metrics else None
 
 if __name__ == '__main__':
-    main(91, 400, np.array([0] * 7), np.array([1] * 7))
+    pop, objs, rank, metrics = main(91, 400, np.array([0] * 7), np.array([1] * 7), 
+                                   collect_metrics=True, export_csv=True)
