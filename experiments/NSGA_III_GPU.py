@@ -3,6 +3,7 @@
 GPU-accelerated implementation of NSGA-III using Apple Metal Performance Shaders
 """
 import numpy as np
+import matplotlib.pyplot as plt  # Add this import
 import time
 from gpu_config import GPUTimer, HAS_GPU, MPS_ENABLED
 import NSGA_III  # Import original implementation
@@ -132,5 +133,22 @@ def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20):
     print(f"Total GPU runtime: {total_time:.2f} seconds")
     print(f"Memory transfer time: {timer.total_transfer_time:.2f} seconds ({100*timer.total_transfer_time/total_time:.1f}%)")
     print(f"Kernel execution time: {timer.total_kernel_time:.2f} seconds ({100*timer.total_kernel_time/total_time:.1f}%)")
+    
+    # Step 3. Sort the results to get Pareto front
+    pf = objs[rank == 0]
+    
+    # Visualization code - same as CPU version
+    ax = plt.figure().add_subplot(111, projection='3d')
+    ax.view_init(45, 45)
+    x = [o[0] for o in pf]
+    y = [o[1] for o in pf]
+    z = [o[2] for o in pf]
+    ax.scatter(x, y, z, color='red')
+    ax.set_xlabel('objective 1')
+    ax.set_ylabel('objective 2')
+    ax.set_zlabel('objective 3')
+    plt.title('The Pareto front of DTLZ1 (GPU Implementation)')
+    plt.savefig('Pareto front - GPU')
+    plt.show()
     
     return pop, objs, rank, timer
