@@ -44,6 +44,7 @@ cd data/add_dim
 # Unzip additional dimension files
 unzip *.zip
 # Return to main directory
+cd ..
 ```
 
 ## Running Experiments
@@ -80,6 +81,27 @@ python graph.py
 This creates:
 - nsga_performance_bars.png - Bar charts showing time, memory usage, throughput, and speedup
 - gpu_time_breakdown.png - Pie chart showing GPU time allocation
+
+
+## Running Baseline Comparisons
+
+To check the first comparison results:
+
+1. Switch to the `base_time` branch:
+   ```bash
+   git checkout base_time
+   ```
+
+2. Run the benchmark experiments:
+   ```bash
+   python experiments/run_benchmark.py
+   ```
+
+This will:
+- Run the base benchmarks for comparison
+- Output results to the benchmark directory for analysis
+
+
 
 ## Performance Metrics
 
