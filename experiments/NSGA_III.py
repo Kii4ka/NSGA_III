@@ -17,10 +17,6 @@ from contextlib import contextmanager
 import psutil
 QUIET_MODE = os.environ.get("NSGA_QUIET_MODE", "0") == "1"
 
-# Later in any print statements, wrap them like:
-if not QUIET_MODE:
-    print("Your message")
-
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 

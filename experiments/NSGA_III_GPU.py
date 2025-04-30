@@ -52,6 +52,85 @@ def cal_obj_gpu(pop, nobj):
         # Fall back to CPU implementation but ensure float32
         return NSGA_III.cal_obj(pop, nobj).astype(DTYPE)
 
+def nsga3_score(objectives, max_value=100):
+    """
+    Calculate score from a NSGA-III perspective using GPU acceleration
+    """
+    # Handle empty objectives or None
+    if objectives is None or (hasattr(objectives, '__len__') and len(objectives) == 0):
+        return max_value / 2  # Return middle score for empty inputs
+        
+    # Handle single value as input
+    if isinstance(objectives, (int, float)):
+        return max_value * (1.0 - objectives / (objectives + 1.0))
+    
+    try:
+        # Use PyTorch if available
+        if HAS_TORCH:
+            try:
+                # Convert to numpy if not already
+                if not isinstance(objectives, np.ndarray):
+                    obj_array = np.array(objectives, dtype=DTYPE)
+                else:
+                    obj_array = objectives.astype(DTYPE)
+                
+                # Check if array is empty after conversion
+                if obj_array.size == 0:
+                    return max_value / 2  # Return middle score for empty arrays
+                    
+                # Make sure we have a 2D array
+                if obj_array.ndim == 1:
+                    obj_array = obj_array.reshape(1, -1)
+                
+                # Move to GPU
+                device = torch.device("mps")
+                obj_tensor = torch.tensor(obj_array, device=device, dtype=torch.float32)
+                
+                # Check again after tensor creation
+                if obj_tensor.numel() == 0:
+                    return max_value / 2
+                
+                # Try to get max values, with safety check
+                try:
+                    max_vals, _ = torch.max(obj_tensor, dim=0)
+                    if torch.numel(max_vals) == 0:
+                        return max_value / 2
+                except Exception:
+                    return max_value / 2
+                    
+                # Avoid division by zero
+                max_vals = torch.where(max_vals == 0, torch.ones_like(max_vals), max_vals)
+                
+                # Normalize and calculate distances
+                obj_norm = obj_tensor / (max_vals.unsqueeze(0) + 1e-10)
+                distances = torch.sqrt(torch.sum(obj_norm**2, dim=1))
+                
+                if distances.numel() == 0:
+                    return max_value / 2
+                    
+                min_dist = torch.min(distances).item()
+                max_dist = torch.max(distances).item()
+                
+                if abs(max_dist) < 1e-10:  # Avoid division by near-zero
+                    return max_value / 2
+                
+                score = max_value * (1.0 - min_dist / (max_dist + 1e-10))
+                return score
+            
+            except Exception as e:
+                if not hasattr(nsga3_score, 'warning_shown'):
+                    print(f"GPU score error: {e}, falling back to CPU")
+                    nsga3_score.warning_shown = True
+    except Exception:
+        pass
+        
+    # CPU fallback
+    try:
+        return NSGA_III.nsga3_score(objectives, max_value)
+    except Exception:
+        # Ultimate fallback
+        return max_value / 2
+
 def main(npop, iter, lb, ub, nobj=3, pc=1, pm=1, eta_c=30, eta_m=20):
     """
     GPU-accelerated implementation of NSGA-III
