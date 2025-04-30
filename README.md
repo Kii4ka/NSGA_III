@@ -1,4 +1,4 @@
-# branch framework_impl contains code for final results
+## branch framework_impl contains code for final results
 
 ### NSGA-III Performance Comparison
 
@@ -8,5 +8,5 @@
 | GPU MPS        | 3,942.46   | 63.21×  | 28.83       | 1,902.37                     |
 
 
-# branch basetime contains code for first comparison results
+## branch base_time contains code for first comparison results
 
