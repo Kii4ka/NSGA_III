@@ -704,17 +704,29 @@ def main():
     
     print_msg("\nRunning NSGA-III CPU vs GPU comparison...", always_print=True)
     
-    # Select a subset of your datasets for comparison (first from each category)
+    # # Select a subset of your datasets for comparison (one from each category)
+    # comparison_datasets = []
+    # for file, folder in datasets_files:
+    #     file_path = os.path.join(data_dir, file)
+    #     if os.path.exists(file_path):
+    #         datasets = load_csv(file_path)
+    #         if datasets:
+    #             comparison_datasets.append(datasets)  # Add first dataset from each category
+    
+    # # To use all selected datasets (one from each category):
+    # compare_nsga_implementations(comparison_datasets)
+
+    # OR to include ALL datasets from all categories:
     comparison_datasets = []
     for file, folder in datasets_files:
         file_path = os.path.join(data_dir, file)
         if os.path.exists(file_path):
             datasets = load_csv(file_path)
             if datasets:
-                comparison_datasets.append(datasets[0])  # Add first dataset from each category
-    
+                comparison_datasets.extend(datasets)  # Add ALL datasets
+
     # Run comparison
-    compare_nsga_implementations(comparison_datasets[:3])  # Limit to 3 datasets for quicker testing
+    compare_nsga_implementations(comparison_datasets)  # Limit to 3 datasets for quicker testing
     
     print_msg("All experiments completed!", always_print=True)
 
